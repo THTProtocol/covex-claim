@@ -93,22 +93,75 @@ function main() {
   const gluePath = join(kaspaDir, 'kaspa.js');
   const wasmPath = pickWasmBin(kaspaDir);
 
-  const glueSrc = readFileSync(gluePath, 'utf8');
+  const glueSrcRaw = readFileSync(gluePath, 'utf8');
   const wasmBin = readFileSync(wasmPath);
 
   // (1) base64 of the wasm bytes (parked verbatim in a text/plain script tag).
   const wasmB64 = wasmBin.toString('base64');
 
-  // (2) base64 of the glue ESM, imported from a blob: module URL, namespace -> window.
-  // We keep the glue UNCHANGED and load it as a module so its exports and import.meta.url
-  // behave exactly as published. The blob URL is same-page (file:// safe). We never call
-  // the glue's default network init; the page calls K.initSync(compiledModule).
+  // (1b) PATCH the glue's __wbg_load for the browser single-file context.
+  //
+  // @onekeyfe/kaspa-wasm ships a glue whose __wbg_load was rewritten for a NODE bundler:
+  // it `require("./kaspa_bg.wasm.js")` and the browser instantiate paths are commented
+  // out. In a browser that `require` throws "require is not defined", so the default
+  // __wbg_init() path is dead here. The named initSync() path is ALSO unusable for this
+  // package: it calls `new WebAssembly.Instance(module)` synchronously, which Chrome
+  // disallows on the main thread for buffers larger than 8MB (this wasm is ~11MB).
+  //
+  // The only main-thread-safe instantiation for an 11MB module is ASYNC
+  // WebAssembly.instantiate(module, imports). So we replace __wbg_load's body to await
+  // exactly that on the WebAssembly.Module the page passes to the default __wbg_init().
+  // The page then calls `await K.default(compiledModule)` (async) instead of initSync.
+  // Everything else in the glue is untouched; the patch is a single function body.
+  const LOAD_NEEDLE =
+    'async function __wbg_load(module, imports) {\n' +
+    '  const loadWebAssembly = require("./kaspa_bg.wasm.js");\n' +
+    '  const bytes = loadWebAssembly();\n' +
+    '  return await WebAssembly.instantiate(bytes.buffer, imports);';
+  const LOAD_REPLACEMENT =
+    'async function __wbg_load(module, imports) {\n' +
+    '  // PATCHED by build-claim-tool.mjs for the browser single-file build: instantiate\n' +
+    '  // the WebAssembly.Module passed in via async WebAssembly.instantiate (no Node\n' +
+    '  // require, no fetch, no >8MB main-thread sync-instance limit).\n' +
+    '  if (module instanceof WebAssembly.Module) {\n' +
+    '    const instance = await WebAssembly.instantiate(module, imports);\n' +
+    '    return { instance, module };\n' +
+    '  }\n' +
+    '  if (module && typeof module.buffer !== "undefined") {\n' +
+    '    return await WebAssembly.instantiate(module.buffer, imports);\n' +
+    '  }\n' +
+    '  return await WebAssembly.instantiate(module, imports);';
+  if (!glueSrcRaw.includes(LOAD_NEEDLE)) {
+    throw new Error(
+      'glue __wbg_load no longer matches the expected Node-require body; the kaspa-wasm ' +
+      'version changed. Re-derive the browser instantiate patch before building.',
+    );
+  }
+  // Also make __wbg_init actually USE the module we pass it (the published body ignores
+  // module_or_path and calls __wbg_load(undefined, ...)). Pass it through to __wbg_load.
+  const INIT_NEEDLE = 'const { instance, module } = await __wbg_load(undefined, imports);';
+  if (!glueSrcRaw.includes(INIT_NEEDLE)) {
+    throw new Error(
+      'glue __wbg_init no longer matches; the kaspa-wasm version changed. Re-derive the patch.',
+    );
+  }
+  const glueSrc = glueSrcRaw
+    .split(LOAD_NEEDLE).join(LOAD_REPLACEMENT)
+    .split(INIT_NEEDLE).join('const { instance, module } = await __wbg_load(module_or_path, imports);');
+
+  // (2) base64 of the (patched) glue ESM, imported from a blob: module URL, namespace ->
+  // window. We load it as a module so its exports and import.meta.url behave as published
+  // (minus the surgical __wbg_load/__wbg_init patch above). The blob URL is same-page
+  // (file:// safe). The page initializes it with the inlined wasm bytes via the ASYNC
+  // default init, and never triggers any network/module fetch.
   const glueB64 = Buffer.from(glueSrc, 'utf8').toString('base64');
   const glueModule = [
-    '// Inlined @onekeyfe/kaspa-wasm ESM glue, imported from a blob: module URL so it runs',
-    '// unmodified under file:// without any network/module fetch. We expose its namespace',
-    '// on window.__KASPA_WASM__; the page initializes it with the inlined wasm bytes via',
-    '// initSync(compiledModule) and never triggers the glue\'s default network init.',
+    '// Inlined @onekeyfe/kaspa-wasm ESM glue (with the browser __wbg_load patch), imported',
+    '// from a blob: module URL so it runs under file:// without any network/module fetch.',
+    '// We expose its namespace on window.__KASPA_WASM__ and resolve window.__KASPA_READY__',
+    '// when done; the page awaits that flag (no race) then inits with the inlined wasm bytes',
+    '// via the ASYNC default init and never triggers any network fetch.',
+    'window.__KASPA_READY__ = new Promise((resolve) => { window.__kaspaResolve__ = resolve; });',
     'const __KASPA_GLUE_SRC__ = atob("' + glueB64 + '");',
     'const __kaspaBlob__ = new Blob([__KASPA_GLUE_SRC__], { type: "text/javascript" });',
     'const __kaspaUrl__ = URL.createObjectURL(__kaspaBlob__);',
@@ -120,6 +173,7 @@ function main() {
     '  console.error("kaspa-wasm glue import failed:", e);',
     '} finally {',
     '  URL.revokeObjectURL(__kaspaUrl__);',
+    '  if (window.__kaspaResolve__) window.__kaspaResolve__(window.__KASPA_WASM__);',
     '}',
   ].join('\n');
 

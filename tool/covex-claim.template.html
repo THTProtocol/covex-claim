@@ -566,6 +566,19 @@ let WASM = null; // resolved kaspa-wasm module namespace once initialized
 
 async function initWasm() {
   if (WASM) return WASM;
+
+  // RACE FIX: the glue is loaded by a separate <script type="module"> whose top-level
+  // await populates window.__KASPA_WASM__. That module finishes AFTER this classic script
+  // runs, so we wait for the readiness promise the glue module publishes instead of
+  // failing immediately. (Fall back to a short poll if the promise is not present, e.g.
+  // an older/unbuilt template.)
+  if (window.__KASPA_READY__ && typeof window.__KASPA_READY__.then === 'function') {
+    await window.__KASPA_READY__;
+  } else {
+    for (let i = 0; i < 200 && !window.__KASPA_WASM__; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
   const mod = window.__KASPA_WASM__;
   if (!mod) throw new Error('kaspa-wasm glue was not injected: run build-claim-tool.mjs first');
 
@@ -579,23 +592,24 @@ async function initWasm() {
   }
   const bin = base64ToBytes(b64);
 
-  // Compile once, then try the init API surface in the same order WalletContext proved:
-  // initSync(compiledModule) first, then several wasm-bindgen variants, then default(bytes).
+  // Compile once. The patched default __wbg_init(compiledModule) does ASYNC
+  // WebAssembly.instantiate(module) under the hood, which is the only main-thread-safe
+  // path for an ~11MB module (Chrome blocks synchronous new WebAssembly.Instance above
+  // 8MB). So try the async default(compiled) FIRST; keep initSync as a last-resort
+  // fallback for smaller/other builds where the sync path is allowed.
   const compiled = await WebAssembly.compile(bin);
   let initialized = false;
   const tries = [
-    () => mod.initSync && mod.initSync(compiled),
-    () => mod.initSync && mod.initSync({ module: compiled }),
     () => mod.default && mod.default(compiled),
     () => mod.default && mod.default({ module_or_path: compiled }),
-    () => mod.default && mod.default(bin),
-    () => mod.default && mod.default({ module_or_path: bin }),
+    () => mod.initSync && mod.initSync(compiled),
+    () => mod.initSync && mod.initSync({ module: compiled }),
   ];
   let lastErr = null;
   for (const t of tries) {
     try {
       const r = t();
-      if (r && typeof r.then === 'function') await r; // default() may be async
+      if (r && typeof r.then === 'function') await r; // default() is async
       initialized = true;
       break;
     } catch (e) {
@@ -619,7 +633,9 @@ function base64ToBytes(b64) {
 // utxo.amount - fee so the SIG_HASH_ALL signature is not redirectable by a tampered amount.
 async function buildUnsignedSpend(p) {
   const k = await initWasm();
-  const { Transaction, payToScriptHashScript, addressToScriptPublicKey } = k;
+  // @onekeyfe/kaspa-wasm exposes the address -> scriptPublicKey helper as
+  // payToAddressScript(address) (addressToScriptPublicKey is not exported in this build).
+  const { Transaction, payToScriptHashScript, payToAddressScript } = k;
 
   const prefix = NETWORK_PREFIX[p.networkId];
   if (!prefix) throw new Error(`unsupported networkId '${p.networkId}'`);
@@ -641,12 +657,17 @@ async function buildUnsignedSpend(p) {
   const ops = sigOpCount(p.kind, { total: p.total });
   const seq = p.sequence !== undefined && p.sequence !== '' ? BigInt(p.sequence) : 0n;
 
+  const outpoint = { transactionId: p.utxo.transactionId, index: p.utxo.index >>> 0 };
   const input = {
-    previousOutpoint: { transactionId: p.utxo.transactionId, index: p.utxo.index >>> 0 },
+    previousOutpoint: outpoint,
     signatureScript: new Uint8Array(0),
     sequence: seq,
     sigOpCount: ops,
     utxo: {
+      // The kaspa-wasm UtxoEntryReference deserializer requires the outpoint INSIDE the
+      // utxo entry (matching IUtxoEntry.outpoint), not only on the input. Omitting it makes
+      // serde fail with a misleading "outpoint is not an object".
+      outpoint,
       address: undefined,
       amount: utxoAmount,
       scriptPublicKey: p.utxo.scriptPublicKey || p2sh,
@@ -655,7 +676,7 @@ async function buildUnsignedSpend(p) {
     },
   };
 
-  const output = { value, scriptPublicKey: addressToScriptPublicKey(p.destAddr) };
+  const output = { value, scriptPublicKey: payToAddressScript(p.destAddr) };
   const lockTime = p.lockTime !== undefined && p.lockTime !== '' ? BigInt(p.lockTime) : 0n;
 
   return new Transaction({
@@ -678,7 +699,16 @@ async function signInput(tx, idx, privKeyHex) {
     const sighashAll = SighashType ? SighashType.All : undefined;
     const sigRaw = createInputSignature(tx, idx, pk, sighashAll);
     let sig = typeof sigRaw === 'string' ? hexToBytes(sigRaw) : new Uint8Array(sigRaw);
-    if (sig.length === 65) sig = sig.slice(0, 64);
+    // Normalize to the raw 64-byte BIP340 signature. @onekeyfe/kaspa-wasm's
+    // createInputSignature returns the 66-byte push-ready framing
+    // [OpData65 (0x41)] [64-byte sig] [SIGHASH_ALL (0x01)]; older/other builds return 65
+    // (sig || sighashtype) or a raw 64. push65() in the pure core re-adds the framing, so we
+    // must hand it the bare 64-byte signature here.
+    if (sig.length === 66 && sig[0] === OPCODES.OpData65 && sig[65] === SIG_HASH_ALL) {
+      sig = sig.slice(1, 65);
+    } else if (sig.length === 65) {
+      sig = sig.slice(0, 64);
+    }
     if (sig.length !== 64) throw new Error(`unexpected signature length ${sig.length}`);
     return sig;
   } finally {

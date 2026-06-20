@@ -216,7 +216,7 @@ downloading or building, compute its SHA-256 and compare it to the value below.
 Published SHA-256 of `covex-claim.html`:
 
 ```
-14e397937cb929ff36f501e59fa01c7a8344224d980571efd3b99da48b12b413
+a8f5d7c1e27d7b5cb88be08d19616e36cc1532820795c643f1c0ceb55b1377e4
 ```
 
 Compute it yourself:
@@ -245,12 +245,17 @@ npm run build
 
 1. Reads `@onekeyfe/kaspa-wasm`'s wasm binary (`kaspa_bg.wasm.bin`) from `node_modules`,
    base64-encodes it, and inlines it into a `<script type="text/plain">`. At runtime the
-   page decodes those bytes and calls `WebAssembly.compile()` locally, then
-   `initSync(compiledModule)`. The glue's network-fetching default init is never invoked.
-2. Reads the ESM glue (`kaspa.js`), base64-encodes it, and imports it from a `blob:` module
-   URL inside an inline `<script type="module">`. A `blob:` ESM import runs the glue
-   unmodified and works under `file://` because it is a same-page object URL, not a network
-   fetch.
+   page decodes those bytes, calls `WebAssembly.compile()` locally, then instantiates the
+   module asynchronously. The glue's network-fetching default init is never invoked.
+2. Reads the ESM glue (`kaspa.js`) and applies one surgical patch: this kaspa-wasm build
+   ships a glue whose loader uses Node's `require(...)` and whose synchronous instantiation
+   path (`initSync`) is blocked by Chrome for buffers larger than 8MB (this wasm is ~11MB).
+   The patch rewrites the glue's loader to instantiate the passed-in `WebAssembly.Module`
+   via async `WebAssembly.instantiate`, which is the only main-thread-safe path for an 11MB
+   module. The patched glue is base64-encoded and imported from a `blob:` module URL inside
+   an inline `<script type="module">`. A `blob:` ESM import works under `file://` because it
+   is a same-page object URL, not a network fetch. The build aborts if the patch points no
+   longer match (kaspa-wasm version drift), so it can never emit a silently broken file.
 
 The result is one HTML file with zero external dependencies: no Covex, no CDN, no sibling
 `.wasm`. The script prints the output path and the artifact's SHA-256.
