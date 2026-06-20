@@ -1,0 +1,11 @@
+# Keep line endings byte-stable so the committed covex-claim.html matches its published
+# SHA-256 on every platform. Do not let git rewrite CRLF/LF on checkout or commit.
+* -text
+
+# The single-file tool is content-addressed by its SHA-256; never normalize it.
+covex-claim.html -text
+*.html -text
+*.js -text
+*.mjs -text
+*.json -text
+*.md -text

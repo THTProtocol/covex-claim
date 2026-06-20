@@ -1,0 +1,22 @@
+{
+  "name": "covex-claim",
+  "version": "1.0.0",
+  "description": "Standalone, open-source, offline tool to claim or refund your Kaspa covenant funds directly on Kaspa, with zero Covex involvement. Works even if hightable.pro is permanently down.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://thtprotocol.github.io/covex-claim/covex-claim.html",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/THTProtocol/covex-claim"
+  },
+  "scripts": {
+    "build": "node tool/build-claim-tool.mjs",
+    "test": "vitest run src/"
+  },
+  "dependencies": {
+    "@onekeyfe/kaspa-wasm": "^1.0.2"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.8"
+  }
+}

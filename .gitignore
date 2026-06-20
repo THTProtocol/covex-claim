@@ -1,0 +1,13 @@
+# Dependencies (the built covex-claim.html already inlines everything it needs)
+node_modules/
+
+# Local env / editor noise
+.env
+.env.*
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Do NOT ignore covex-claim.html: the prebuilt single-file tool is committed on purpose
+# so GitHub Pages serves it and users can download a working copy without a build step.

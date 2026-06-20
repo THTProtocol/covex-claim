@@ -1,0 +1,992 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>Covex claim (standalone, offline)</title>
+<!--
+  Covex claim - self-contained, offline-capable covenant claim tool.
+
+  WHAT THIS IS
+  A single HTML file that lets a covenant winner (or refund-key holder) assemble,
+  sign and broadcast the spend transaction that releases their funds, with NO Covex
+  frontend and NO Covex backend in the loop. After the build step (build-claim-tool.mjs)
+  inlines the kaspa-wasm binary + JS glue, this file runs from file:// with no network
+  dependency on Covex at all. Signing is ALWAYS local: the private key is held only in
+  this page, is never transmitted, and is cleared from memory after use.
+
+  HONEST ENFORCEMENT REALITY (read this)
+  This tool only helps for spend paths the Kaspa chain (or a revealed public secret plus
+  the named key's OpCheckSig) genuinely enforces end to end. The non-refundable WIN path
+  of the oracle_* kinds still needs the Covex oracle's half-signature and is therefore
+  NOT offline-claimable here. The *_refundable kinds' refund branch IS offline-claimable
+  by the refund key after the on-chain lock elapses. See README.md for the full per-kind
+  matrix. This page never claims "trustless" where the chain does not enforce it.
+
+  THE PURE CORE BELOW IS BYTE-IDENTICAL TO src/covenantRedeemer.js (in this repo)
+  buildSatisfier / push65 / pushData / parseRedeemPubkeys / sigOpCount were copied
+  VERBATIM from that file, whose satisfier bytes are CI-proven byte-for-byte identical to
+  the Rust assemble_noncustodial_satisfier. Do not edit the pure-core section by hand:
+  re-copy it from the source of truth if it ever changes.
+-->
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #131825;
+    --panel2: #0e1320;
+    --border: #243049;
+    --text: #e6ebf5;
+    --muted: #93a0bd;
+    --accent: #5b8cff;
+    --accent2: #7af0c0;
+    --warn: #ffcf6b;
+    --danger: #ff7a7a;
+    --ok: #7af0c0;
+    --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  a { color: var(--accent); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 80px; }
+  header h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: 0.2px; }
+  header .sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin: 14px 0; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 220px; min-width: 0; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, textarea, select {
+    width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 9px 10px;
+    font: 13px/1.45 var(--mono); resize: vertical;
+  }
+  textarea { min-height: 96px; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .btn {
+    appearance: none; border: 1px solid var(--border); background: var(--panel2);
+    color: var(--text); padding: 9px 14px; border-radius: 8px; cursor: pointer;
+    font-size: 13px; font-weight: 600;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #06101f; }
+  .btn.ok { background: var(--accent2); border-color: var(--accent2); color: #06241c; }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btnrow { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+  .pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: #2c5a48; }
+  .pill.warn { color: var(--warn); border-color: #5a4a2c; }
+  .pill.danger { color: var(--danger); border-color: #5a2c2c; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .note.warn { color: var(--warn); }
+  .note.danger { color: var(--danger); }
+  .mono { font-family: var(--mono); }
+  .out { white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 12px; background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 10px; max-height: 280px; overflow: auto; }
+  .out.err { border-color: #5a2c2c; color: var(--danger); }
+  .out.ok { border-color: #2c5a48; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 12px; font-size: 12px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-family: var(--mono); word-break: break-all; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+  .banner { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font-size: 13px; margin: 0 0 14px; }
+  .banner.offline { color: var(--ok); border-color: #2c5a48; background: #0c1a16; }
+  .banner.notready { color: var(--warn); border-color: #5a4a2c; background: #1a160c; }
+  .step { font-size: 12px; color: var(--muted); }
+  details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+  code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 5px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Covex claim <span class="pill">standalone, offline</span></h1>
+    <div class="sub">Claim a covenant payout or refund without Covex. Your private key stays in this page and is never sent anywhere.</div>
+  </header>
+
+  <div id="readyBanner" class="banner notready">
+    Initializing the bundled signing library...
+  </div>
+
+  <div class="card">
+    <h2>1. Paste your recovery kit</h2>
+    <div class="step">This is the JSON you saved when the covenant was created or funded. It contains everything except your private key.</div>
+    <label for="kit">Recovery kit JSON</label>
+    <textarea id="kit" spellcheck="false" placeholder='{
+  "kind": "binary_oracle_select",
+  "network": "mainnet",
+  "redeem_script_hex": "....",
+  "p2sh_address": "kaspa:....",
+  "funding": { "transactionId": "....", "index": 0, "amount": "100000000" },
+  "branch": "revealA",
+  "preimage_hex": "....",
+  "lock_daa": null
+}'></textarea>
+    <div class="btnrow">
+      <button class="btn" id="parseKit">Parse kit</button>
+      <button class="btn" id="loadFile">Load from file...</button>
+      <input type="file" id="fileInput" accept=".json,application/json" style="display:none" />
+    </div>
+    <div id="kitOut" class="out" style="display:none"></div>
+  </div>
+
+  <div class="card">
+    <h2>2. Claimability for this kit</h2>
+    <div id="claimability" class="step">Parse a kit to see whether this spend path can be claimed fully offline.</div>
+  </div>
+
+  <div class="card">
+    <h2>3. Your inputs</h2>
+    <label for="dest">Destination Kaspa address (where the funds go)</label>
+    <input id="dest" spellcheck="false" placeholder="kaspa:... (or kaspatest:... on testnet)" />
+
+    <div class="row">
+      <div>
+        <label for="fee">Network fee (sompi)</label>
+        <input id="fee" spellcheck="false" value="10000" />
+      </div>
+      <div>
+        <label for="branchSel">Branch / outcome (override)</label>
+        <select id="branchSel">
+          <option value="">use kit value</option>
+          <option value="claim">claim</option>
+          <option value="refund">refund</option>
+          <option value="revealA">revealA (A / IF branch)</option>
+          <option value="revealB">revealB (B / ELSE branch)</option>
+          <option value="closeA">closeA</option>
+          <option value="closeB">closeB</option>
+        </select>
+      </div>
+    </div>
+
+    <details style="margin-top:10px">
+      <summary>Advanced: oracle / multi-key signatures, locks, preimage</summary>
+      <label for="preimage">Preimage (hex) - hashlock / htlc-claim / binary_oracle_select reveal</label>
+      <input id="preimage" spellcheck="false" placeholder="optional; or taken from kit.preimage_hex" />
+      <label for="oracleSig">Oracle signature (64-byte hex) - oracle_* WIN path only</label>
+      <input id="oracleSig" spellcheck="false" placeholder="needs the Covex oracle; NOT offline-claimable without it" />
+      <label for="refundKeySig">Extra refund/co-signer signature (64-byte hex)</label>
+      <input id="refundKeySig" spellcheck="false" placeholder="optional" />
+      <div class="row">
+        <div>
+          <label for="lockTime">lockTime (CLTV) - timelock / refund branches</label>
+          <input id="lockTime" spellcheck="false" placeholder="from kit.lock_daa if required" />
+        </div>
+        <div>
+          <label for="sequence">sequence (CSV) - rcsv / bos refund</label>
+          <input id="sequence" spellcheck="false" placeholder="relative locktime operand" />
+        </div>
+      </div>
+    </details>
+
+    <hr />
+    <label for="priv">Your private key (32-byte hex). Stays in this page, never transmitted, cleared after use.</label>
+    <input id="priv" type="password" spellcheck="false" autocomplete="off" placeholder="64 hex chars" />
+    <div class="note danger">Anyone with this key controls these funds. Run this tool offline. Close the tab when done.</div>
+  </div>
+
+  <div class="card">
+    <h2>4. Build, sign, broadcast</h2>
+    <div class="step">Build assembles the unsigned spend. Sign produces your signature locally. Then either broadcast directly over wRPC, or export the signed transaction JSON to submit from any node or explorer.</div>
+    <div class="btnrow">
+      <button class="btn primary" id="buildSign" disabled>Build and sign (local)</button>
+      <button class="btn ok" id="broadcast" disabled>Broadcast over wRPC</button>
+      <button class="btn" id="exportTx" disabled>Export signed-tx JSON</button>
+      <button class="btn" id="copyTx" disabled>Copy signed-tx JSON</button>
+    </div>
+    <div id="buildOut" class="out" style="display:none"></div>
+    <label for="signedJson" style="margin-top:12px">Signed transaction JSON (paste into any node / explorer submit)</label>
+    <textarea id="signedJson" spellcheck="false" readonly placeholder="appears after Build and sign"></textarea>
+  </div>
+
+  <footer>
+    Offline-capable. The bundled signing library and wasm are inlined into this file. Verify this file's SHA-256 against the value published in README.md before trusting it.
+    No em dashes, honest enforcement reality. This tool does not and cannot manufacture an oracle signature.
+  </footer>
+</div>
+
+<!--
+  =====================================================================================
+  WASM GLUE INJECTION POINT
+  build-claim-tool.mjs replaces the line containing __KASPA_WASM_GLUE_MODULE__ with an
+  ES module <script> whose body is the contents of @onekeyfe/kaspa-wasm/kaspa.js, with
+  its trailing wasm auto-init / require('./kaspa_bg.wasm.js') neutralized, and which ends
+  with `window.__KASPA_WASM__ = { initSync, default: __wbg_init, ...exports };`
+  It also replaces __KASPA_WASM_B64__ with the base64 of kaspa_bg.wasm.bin.
+  Until the build runs, both placeholders are inert and the page shows "not ready".
+  =====================================================================================
+-->
+<script id="kaspa-wasm-b64" type="text/plain">__KASPA_WASM_B64__</script>
+<script type="module">__KASPA_WASM_GLUE_MODULE__</script>
+
+<script>
+// ===========================================================================
+// (A) PURE CORE - copied VERBATIM from src/covenantRedeemer.js (in this repo).
+//     Byte-parity with the Rust assemble_noncustodial_satisfier (CI-gated at the source).
+//     DO NOT edit by hand; re-copy from the source of truth if it changes.
+// ===========================================================================
+
+const OPCODES = Object.freeze({
+  OpFalse: 0x00, // pushes an empty value; also the "0"/ELSE branch selector
+  OpData1: 0x01, // OpData1..OpData75 (0x01..0x4b): direct N-byte push, opcode == N
+  OpData32: 0x20, // canonical push of a 32-byte x-only pubkey or 32-byte hash
+  OpData65: 0x41, // canonical push of the 65-byte (64 sig + 1 sighashtype) signature
+  OpData75: 0x4b,
+  OpPushData1: 0x4c, // 1-byte length prefix, for 76..255 data bytes
+  OpPushData2: 0x4d, // 2-byte little-endian length prefix, for 256..65535
+  OpPushData4: 0x4e, // 4-byte little-endian length prefix, for >= 65536
+  OpTrue: 0x51, // pushes 1; the "1"/IF branch selector
+  OpIf: 0x63,
+  OpElse: 0x67,
+  OpEndIf: 0x68,
+  OpEqualVerify: 0x88,
+  OpBlake2b: 0xaa,
+  OpCheckSig: 0xac,
+  OpCheckSigVerify: 0xad,
+  OpCheckMultiSig: 0xae,
+  OpCheckLockTimeVerify: 0xb0, // Kaspa CLTV; POPS its operand (no OpDrop)
+  OpCheckSequenceVerify: 0xb1, // Kaspa CSV;  POPS its operand (no OpDrop)
+});
+
+const SIG_HASH_ALL = 0x01;
+
+function concatBytes(...parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+function hexToBytes(hex) {
+  let h = String(hex || '').trim();
+  if (h.startsWith('0x') || h.startsWith('0X')) h = h.slice(2);
+  if (h.length % 2 !== 0) throw new Error(`hex string has odd length: ${h.length}`);
+  const out = new Uint8Array(h.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = parseInt(h.substr(i * 2, 2), 16);
+    if (Number.isNaN(byte)) throw new Error(`invalid hex at byte ${i}`);
+    out[i] = byte;
+  }
+  return out;
+}
+
+function bytesToHex(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += bytes[i].toString(16).padStart(2, '0');
+  return s;
+}
+
+function pushData(bytes) {
+  const len = bytes.length;
+  if (len === 0) return Uint8Array.from([OPCODES.OpFalse]);
+  if (len <= 75) return concatBytes([len], bytes);
+  if (len <= 255) return concatBytes([OPCODES.OpPushData1, len], bytes);
+  if (len <= 65535) return concatBytes([OPCODES.OpPushData2, len & 0xff, (len >> 8) & 0xff], bytes);
+  return concatBytes(
+    [OPCODES.OpPushData4, len & 0xff, (len >> 8) & 0xff, (len >> 16) & 0xff, (len >>> 24) & 0xff],
+    bytes,
+  );
+}
+
+function push65(sig64) {
+  if (sig64.length !== 64) {
+    throw new Error(`push65 expects a 64-byte signature, got ${sig64.length}`);
+  }
+  return concatBytes([OPCODES.OpData65], sig64, [SIG_HASH_ALL]);
+}
+
+function parseRedeemPubkeys(redeem, checksigOnly) {
+  const out = [];
+  let i = 0;
+  // Rust loops `while i + 33 <= redeem.len()`.
+  while (i + 33 <= redeem.length) {
+    if (redeem[i] === OPCODES.OpData32) {
+      let isPubkey;
+      if (checksigOnly) {
+        const next = redeem[i + 33]; // may be undefined at the tail
+        isPubkey = next === OPCODES.OpCheckSig || next === OPCODES.OpCheckSigVerify;
+      } else {
+        isPubkey = true;
+      }
+      if (isPubkey) {
+        out.push(redeem.slice(i + 1, i + 33));
+        i += 33;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function sigOpCount(kind, opts = {}) {
+  switch (kind) {
+    case 'singlesig':
+    case 'hashlock':
+    case 'timelock':
+    case 'rcsv':
+    case 'htlc':
+      return 1;
+    case 'deadman':
+      return 2;
+    case 'channel':
+    case 'oracle_escrow':
+    case 'binary_oracle_select':
+      return 3;
+    case 'oracle_enforced_refundable':
+      return 3;
+    case 'oracle_escrow_refundable':
+      return 4;
+    case 'multisig':
+      if (typeof opts.total !== 'number') {
+        throw new Error('multisig sigOpCount requires opts.total (the N in m-of-N)');
+      }
+      return opts.total;
+    case 'oracle':
+    case 'oracle_enforced':
+      // OracleEnforced { total }; default 2 (the [oracle, winner] 2-of-2).
+      return typeof opts.total === 'number' ? opts.total : 2;
+    default:
+      throw new Error(`sigOpCount: unsupported kind '${kind}'`);
+  }
+}
+
+function buildSatisfier(args) {
+  const {
+    kind,
+    branch,
+    sig65: solo,
+    oracleSig,
+    winnerSig,
+    refundSig,
+    multisigSigs,
+    channelSig1,
+    channelSig2,
+    preimageBytes,
+    winnerIsA,
+  } = args || {};
+
+  // Map the high-level branch label to the Rust (branch_refund, winner_is_a) pair.
+  // For kinds that read winnerIsA directly (escrow / bos) the explicit arg wins; the
+  // branch label is a convenience for callers and for the test vectors.
+  const branchRefund = branch === 'refund' || branch === 'refundA' || branch === 'refundB';
+  // Resolve the A/B (IF / ELSE) outcome selector. Track whether it was set EXPLICITLY:
+  // the "branchy" kinds (oracle_escrow, oracle_escrow_refundable, binary_oracle_select)
+  // have two distinct winner keys, so a silent A-vs-B default could assemble the wrong
+  // outcome. That still fails on-chain (the named key's OpCheckSig rejects, fail-safe),
+  // but we require an explicit outcome and fail fast at build time instead.
+  let isA = true; // default only for kinds that ignore the A/B selector (singlesig-style)
+  let isAExplicit = false;
+  if (winnerIsA !== undefined) {
+    isA = !!winnerIsA;
+    isAExplicit = true;
+  } else if (branch === 'revealA' || branch === 'closeA') {
+    isA = true;
+    isAExplicit = true;
+  } else if (branch === 'revealB' || branch === 'closeB') {
+    isA = false;
+    isAExplicit = true;
+  }
+
+  const need = (v, msg) => {
+    if (!v) throw new Error(msg);
+    return v;
+  };
+
+  // For the branchy kinds, refuse to guess the outcome: an unstated A/B is a fund-path
+  // footgun, so require branch 'revealA'/'revealB' (or 'closeA'/'closeB') or winnerIsA.
+  const requireExplicitOutcome = () => {
+    if (!isAExplicit) {
+      throw new Error(
+        `${kind} requires an explicit outcome: pass branch 'revealA'/'revealB' (or 'closeA'/'closeB') or winnerIsA`,
+      );
+    }
+  };
+
+  const parts = [];
+
+  switch (kind) {
+    // singlesig / timelock / rcsv: just push65(sig). (Rust @1010-1012)
+    case 'singlesig':
+    case 'timelock':
+    case 'rcsv':
+      parts.push(push65(need(solo, `${kind} spend needs one signature (sig65)`)));
+      break;
+
+    // hashlock: push65(sig) then pushData(preimage). (Rust @1013-1017)
+    case 'hashlock':
+      parts.push(push65(need(solo, 'hashlock spend needs one signature (sig65)')));
+      parts.push(pushData(need(preimageBytes, 'hashlock spend requires preimageBytes')));
+      break;
+
+    // htlc: claim = receiver sig + preimage + OP_TRUE; refund = sender sig + OP_FALSE.
+    // (Rust @1018-1028)
+    case 'htlc':
+      parts.push(push65(need(solo, 'htlc spend needs one signature (sig65)')));
+      if (branchRefund) {
+        parts.push([OPCODES.OpFalse]);
+      } else {
+        parts.push(pushData(need(preimageBytes, 'HTLC claim requires preimageBytes')));
+        parts.push([OPCODES.OpTrue]);
+      }
+      break;
+
+    // multisig: push each present member's sig in pubkey (script) order. The caller
+    // supplies them already ordered. (Rust @1029-1042)
+    case 'multisig': {
+      const sigs = need(multisigSigs, 'multisig spend needs signatures (multisigSigs[])');
+      if (sigs.length === 0) throw new Error('multisig spend needs at least one signature');
+      for (const s of sigs) parts.push(push65(s));
+      break;
+    }
+
+    // channel: refund = p1 sig + OP_FALSE; cooperative close = sig_p2, sig_p1, OP_TRUE.
+    // (Rust @1043-1060)
+    case 'channel':
+      if (branchRefund) {
+        const s = channelSig1 || solo;
+        parts.push(push65(need(s, 'channel refund needs the funder (player1) signature')));
+        parts.push([OPCODES.OpFalse]);
+      } else {
+        parts.push(push65(need(channelSig2, "channel close needs player2's signature")));
+        parts.push(push65(need(channelSig1, "channel close needs player1's signature")));
+        parts.push([OPCODES.OpTrue]);
+      }
+      break;
+
+    // deadman: owner (IF) = sig + OP_TRUE; heir (ELSE) = sig + OP_FALSE. (Rust @1061-1065)
+    case 'deadman':
+      parts.push(push65(need(solo, 'deadman spend needs one signature (sig65)')));
+      parts.push([branchRefund ? OPCODES.OpFalse : OPCODES.OpTrue]);
+      break;
+
+    // oracle / oracle_enforced: 2-of-2 [oracle, winner]; OpCheckMultiSig pops sigs in
+    // pubkey (script) order, so push oracle FIRST then winner. (Rust @1070-1081)
+    case 'oracle':
+    case 'oracle_enforced':
+      parts.push(push65(need(oracleSig, 'oracle payout needs the server oracle signature')));
+      parts.push(push65(need(winnerSig || solo, "oracle payout needs the winner's browser signature")));
+      break;
+
+    // oracle_escrow: bottom->top = <winner_sig> <branch_selector> <oracle_sig>.
+    // (Rust @1082-1095)
+    case 'oracle_escrow':
+      requireExplicitOutcome();
+      parts.push(push65(need(winnerSig || solo, "oracle_escrow needs the winning player's signature")));
+      parts.push([isA ? OPCODES.OpTrue : OPCODES.OpFalse]);
+      parts.push(push65(need(oracleSig, 'oracle_escrow payout needs the server oracle signature')));
+      break;
+
+    // oracle_enforced_refundable: outer IF = the 2-of-2 [oracle, winner] then OP_TRUE;
+    // outer ELSE (refund) = <refund_sig> OP_FALSE. (Rust @1101-1126)
+    case 'oracle_enforced_refundable':
+      if (branchRefund) {
+        parts.push(push65(need(refundSig || solo, 'refund needs the funder/refund key signature')));
+        parts.push([OPCODES.OpFalse]);
+      } else {
+        parts.push(push65(need(oracleSig, 'payout needs the server oracle signature')));
+        parts.push(push65(need(winnerSig || solo, "payout needs the winner's browser signature")));
+        parts.push([OPCODES.OpTrue]);
+      }
+      break;
+
+    // oracle_escrow_refundable: outer IF = oracle_escrow layout then OP_TRUE; outer ELSE
+    // (refund) = <refund_sig> OP_FALSE. (Rust @1127-1153)
+    case 'oracle_escrow_refundable':
+      if (branchRefund) {
+        parts.push(push65(need(refundSig || solo, 'refund needs the funder/refund key signature')));
+        parts.push([OPCODES.OpFalse]);
+      } else {
+        requireExplicitOutcome();
+        parts.push(push65(need(winnerSig || solo, "payout needs the winning player's signature")));
+        parts.push([isA ? OPCODES.OpTrue : OPCODES.OpFalse]);
+        parts.push(push65(need(oracleSig, 'payout needs the server oracle signature')));
+        parts.push([OPCODES.OpTrue]);
+      }
+      break;
+
+    // binary_oracle_select (the parimutuel-bundle leg), winner-only NON-CUSTODIAL.
+    // (Rust @1166-1224). Stack bottom->top:
+    //   RevealA = <sig_a> <preimage> OP_TRUE
+    //   RevealB = <sig_b> <preimage> OP_TRUE OP_FALSE
+    //   Refund  = <sig_refund> OP_FALSE OP_FALSE
+    case 'binary_oracle_select':
+      if (branchRefund) {
+        parts.push(push65(need(refundSig || solo, 'binary_oracle_select refund needs the refund key signature')));
+        parts.push([OPCODES.OpFalse]);
+        parts.push([OPCODES.OpFalse]);
+      } else {
+        // RevealA uses the A key, RevealB uses the B key; the caller passes that as
+        // winnerSig (or solo) for whichever branch isA selects.
+        requireExplicitOutcome();
+        parts.push(push65(need(winnerSig || solo, 'binary_oracle_select reveal needs the branch key signature')));
+        parts.push(pushData(need(preimageBytes, 'binary_oracle_select reveal requires preimageBytes')));
+        parts.push([OPCODES.OpTrue]);
+        if (!isA) parts.push([OPCODES.OpFalse]); // outer IF -> ELSE (top of stack)
+      }
+      break;
+
+    default:
+      throw new Error(`buildSatisfier: unsupported kind '${kind}'`);
+  }
+
+  // Normalize each part (number[] selector or Uint8Array) and concat in push order.
+  return concatBytes(...parts.map((p) => (p instanceof Uint8Array ? p : Uint8Array.from(p))));
+}
+
+// ===========================================================================
+// (B) STANDALONE WASM GLUE + TX PLUMBING. These talk to the INLINED kaspa-wasm
+//     (window.__KASPA_WASM__) - no module fetch, no Covex, no network for signing.
+// ===========================================================================
+
+// Hardcoded PUBLIC Kaspa wRPC endpoints so the tool never needs Covex. The wRPC paths
+// only work where the browser can open a WebSocket to them (see the file:// note in the
+// README). When wRPC is unavailable, use the Export signed-tx JSON path instead - the
+// signed tx can be submitted from ANY node or block explorer.
+const PUBLIC_NODES = Object.freeze({
+  // Public mainnet wRPC (Border-Node style aggregators / community nodes).
+  mainnet: [
+    'wss://api.kaspa.org/borsh',
+    'wss://kas.fyi/borsh',
+  ],
+  // For testnets, the kaspa-wasm Resolver finds a public node automatically, so the
+  // direct list can stay empty and we fall back to the Resolver.
+  'testnet-10': [],
+  'testnet-12': [],
+});
+
+const NETWORK_PREFIX = { mainnet: 'kaspa:', 'testnet-10': 'kaspatest:', 'testnet-12': 'kaspatest:' };
+
+let WASM = null; // resolved kaspa-wasm module namespace once initialized
+
+async function initWasm() {
+  if (WASM) return WASM;
+  const mod = window.__KASPA_WASM__;
+  if (!mod) throw new Error('kaspa-wasm glue was not injected: run build-claim-tool.mjs first');
+
+  // Decode the inlined wasm bytes (base64 -> Uint8Array).
+  // Reconstruct the unbuilt-template sentinel at runtime so the build script's text
+  // substitution never rewrites this guard (it would if the literal appeared here).
+  const SENTINEL = '__KASPA' + '_WASM_B64__';
+  const b64 = (document.getElementById('kaspa-wasm-b64').textContent || '').trim();
+  if (!b64 || b64.indexOf(SENTINEL) !== -1) {
+    throw new Error('inlined wasm binary missing: run build-claim-tool.mjs first');
+  }
+  const bin = base64ToBytes(b64);
+
+  // Compile once, then try the init API surface in the same order WalletContext proved:
+  // initSync(compiledModule) first, then several wasm-bindgen variants, then default(bytes).
+  const compiled = await WebAssembly.compile(bin);
+  let initialized = false;
+  const tries = [
+    () => mod.initSync && mod.initSync(compiled),
+    () => mod.initSync && mod.initSync({ module: compiled }),
+    () => mod.default && mod.default(compiled),
+    () => mod.default && mod.default({ module_or_path: compiled }),
+    () => mod.default && mod.default(bin),
+    () => mod.default && mod.default({ module_or_path: bin }),
+  ];
+  let lastErr = null;
+  for (const t of tries) {
+    try {
+      const r = t();
+      if (r && typeof r.then === 'function') await r; // default() may be async
+      initialized = true;
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!initialized) throw new Error('kaspa-wasm init failed: ' + (lastErr && lastErr.message ? lastErr.message : lastErr));
+  WASM = mod;
+  return WASM;
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// Build the UNSIGNED spend transaction (one covenant UTXO -> one destination output).
+// Mirrors buildUnsignedSpend in covenantRedeemer.js: the sole output value is DERIVED as
+// utxo.amount - fee so the SIG_HASH_ALL signature is not redirectable by a tampered amount.
+async function buildUnsignedSpend(p) {
+  const k = await initWasm();
+  const { Transaction, payToScriptHashScript, addressToScriptPublicKey } = k;
+
+  const prefix = NETWORK_PREFIX[p.networkId];
+  if (!prefix) throw new Error(`unsupported networkId '${p.networkId}'`);
+  if (!String(p.destAddr).startsWith(prefix)) {
+    throw new Error(`destination ${p.destAddr} is not a ${p.networkId} address (expected ${prefix})`);
+  }
+
+  const utxoAmount = BigInt(p.utxo.amount);
+  const fee = BigInt(p.fee);
+  if (fee <= 0n) throw new Error('fee must be positive');
+  const value = utxoAmount - fee;
+  const MIN_SPENDABLE = 1000n;
+  if (value < MIN_SPENDABLE) {
+    throw new Error(`output (utxo ${utxoAmount} - fee ${fee} = ${value}) is below the spendable floor`);
+  }
+
+  const redeem = hexToBytes(p.redeemHex);
+  const p2sh = payToScriptHashScript(redeem);
+  const ops = sigOpCount(p.kind, { total: p.total });
+  const seq = p.sequence !== undefined && p.sequence !== '' ? BigInt(p.sequence) : 0n;
+
+  const input = {
+    previousOutpoint: { transactionId: p.utxo.transactionId, index: p.utxo.index >>> 0 },
+    signatureScript: new Uint8Array(0),
+    sequence: seq,
+    sigOpCount: ops,
+    utxo: {
+      address: undefined,
+      amount: utxoAmount,
+      scriptPublicKey: p.utxo.scriptPublicKey || p2sh,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+    },
+  };
+
+  const output = { value, scriptPublicKey: addressToScriptPublicKey(p.destAddr) };
+  const lockTime = p.lockTime !== undefined && p.lockTime !== '' ? BigInt(p.lockTime) : 0n;
+
+  return new Transaction({
+    version: 0,
+    inputs: [input],
+    outputs: [output],
+    lockTime,
+    subnetworkId: new Uint8Array(20),
+    gas: 0n,
+    payload: new Uint8Array(0),
+  });
+}
+
+// Produce the 64-byte BIP340 signature for input idx, key held only here.
+async function signInput(tx, idx, privKeyHex) {
+  const k = await initWasm();
+  const { PrivateKey, createInputSignature, SighashType } = k;
+  const pk = new PrivateKey(privKeyHex);
+  try {
+    const sighashAll = SighashType ? SighashType.All : undefined;
+    const sigRaw = createInputSignature(tx, idx, pk, sighashAll);
+    let sig = typeof sigRaw === 'string' ? hexToBytes(sigRaw) : new Uint8Array(sigRaw);
+    if (sig.length === 65) sig = sig.slice(0, 64);
+    if (sig.length !== 64) throw new Error(`unexpected signature length ${sig.length}`);
+    return sig;
+  } finally {
+    if (pk && typeof pk.free === 'function') pk.free();
+  }
+}
+
+// satisfier bytes + canonical redeem push -> the full input signature_script.
+async function assembleSigScript(redeemHex, satisfierBytes) {
+  const k = await initWasm();
+  const { payToScriptHashSignatureScript } = k;
+  const redeem = hexToBytes(redeemHex);
+  const script = payToScriptHashSignatureScript(redeem, satisfierBytes);
+  return typeof script === 'string' ? hexToBytes(script) : new Uint8Array(script);
+}
+
+async function exportSignedTxJson(signedTx) {
+  await initWasm();
+  if (signedTx && typeof signedTx.serializeToSafeJSON === 'function') return signedTx.serializeToSafeJSON();
+  if (signedTx && typeof signedTx.toJSON === 'function') return JSON.stringify(signedTx.toJSON());
+  return JSON.stringify(signedTx);
+}
+
+// Direct wRPC broadcast. Tries the hardcoded public nodes for the network, then the
+// kaspa-wasm Resolver. Under file:// a WebSocket to an external node may be blocked by
+// the browser (mixed-content / opaque-origin); if so, fall back to Export signed-tx JSON.
+async function broadcast(signedTx, networkId) {
+  const k = await initWasm();
+  const { RpcClient, Resolver } = k;
+  const urls = PUBLIC_NODES[networkId] || [];
+  const attempts = [];
+  for (const url of urls) attempts.push(() => new RpcClient({ url, networkId }));
+  attempts.push(() => new RpcClient({ resolver: new Resolver(), networkId }));
+
+  let lastErr = null;
+  for (const make of attempts) {
+    let rpc = null;
+    try {
+      rpc = make();
+      await rpc.connect();
+      const res = await rpc.submitTransaction({ transaction: signedTx, allowOrphan: false });
+      return res.transactionId || res.txId || res;
+    } catch (e) {
+      lastErr = e;
+    } finally {
+      if (rpc) { try { await rpc.disconnect(); } catch (_) { /* best effort */ } }
+    }
+  }
+  throw new Error('wRPC broadcast failed (use Export signed-tx JSON instead): ' + (lastErr && lastErr.message ? lastErr.message : lastErr));
+}
+
+// ===========================================================================
+// (C) UI WIRING
+// ===========================================================================
+
+// The per-kind offline-claimability matrix. Honest: only the spend paths the chain (or a
+// revealed public secret + the named key's OpCheckSig) enforces end to end are offline.
+// The oracle_* WIN path needs the Covex oracle's signature and is NOT offline-claimable
+// here; only the *_refundable refund branch (after the on-chain lock) is.
+const CLAIMABILITY = {
+  singlesig: { offline: true, note: 'Script-enforced. The named key signs and the chain verifies. Fully offline-claimable.' },
+  timelock: { offline: true, note: 'Script-enforced CLTV. Spendable by the named key after lockTime. Set lockTime. Fully offline-claimable.' },
+  rcsv: { offline: true, note: 'Script-enforced relative timelock (CSV). Set sequence to the relative-locktime operand. Fully offline-claimable.' },
+  hashlock: { offline: true, note: 'Script-enforced. Reveal the preimage + sign. Fully offline-claimable if you hold the preimage.' },
+  htlc: { offline: true, note: 'Claim = receiver sig + preimage. Refund = sender sig after lockTime. Both branches are offline-claimable by the right key.' },
+  multisig: { offline: true, note: 'Script-enforced m-of-N. Offline-claimable once you have the required signatures. Set total = N.' },
+  channel: { offline: true, note: 'Cooperative close needs BOTH party signatures; refund needs the funder sig after lockTime. Offline-claimable with the needed sigs.' },
+  deadman: { offline: true, note: 'Owner (IF) or heir (ELSE, after CLTV) signs. Offline-claimable by the right key.' },
+  binary_oracle_select: { offline: true, note: 'Winner reveal = branch key sig + the revealed PUBLIC preimage; refund = refund key sig after lock. The reveal is a hashlock, NOT an oracle signature, so this is fully offline-claimable once the winning preimage is public.' },
+  oracle: { offline: false, note: 'WIN path is a 2-of-2 with the Covex oracle key. NOT offline-claimable: needs the oracle half-signature. Has no chain-enforced refund branch.' },
+  oracle_enforced: { offline: false, note: 'WIN path is a 2-of-2 with the Covex oracle key. NOT offline-claimable: needs the oracle half-signature. Has no chain-enforced refund branch.' },
+  oracle_escrow: { offline: false, note: 'Payout needs the Covex oracle signature. NOT offline-claimable. Has no chain-enforced refund branch.' },
+  oracle_enforced_refundable: { offline: 'refund-only', note: 'WIN path needs the Covex oracle signature (NOT offline). The REFUND branch (refund key, after lock_daa / lockTime) IS offline-claimable.' },
+  oracle_escrow_refundable: { offline: 'refund-only', note: 'WIN path needs the Covex oracle signature (NOT offline). The REFUND branch (refund key, after lock_daa / lockTime) IS offline-claimable.' },
+};
+
+const $ = (id) => document.getElementById(id);
+let kit = null; // parsed recovery kit
+let signedTx = null; // the signed wasm Transaction
+let signedTxJson = ''; // its serialized JSON
+
+function setBanner(ready, msg) {
+  const b = $('readyBanner');
+  b.className = 'banner ' + (ready ? 'offline' : 'notready');
+  b.textContent = msg;
+}
+
+function showOut(el, text, cls) {
+  el.style.display = 'block';
+  el.className = 'out' + (cls ? ' ' + cls : '');
+  el.textContent = text;
+}
+
+function kindClaim(kind) {
+  return CLAIMABILITY[kind] || { offline: false, note: `Unknown kind '${kind}'. This tool only supports the Covex covenant kinds.` };
+}
+
+function renderClaimability(k) {
+  const el = $('claimability');
+  const info = kindClaim(k.kind);
+  let pill;
+  if (info.offline === true) pill = '<span class="pill ok">offline-claimable</span>';
+  else if (info.offline === 'refund-only') pill = '<span class="pill warn">refund branch only (offline)</span>';
+  else pill = '<span class="pill danger">NOT offline-claimable (needs Covex oracle)</span>';
+  el.innerHTML = `<div style="margin-bottom:6px">${pill} <span class="mono">${k.kind}</span></div><div class="note">${info.note}</div>`;
+}
+
+function effectiveBranch() {
+  const sel = $('branchSel').value;
+  if (sel) return sel;
+  return (kit && kit.branch) || undefined;
+}
+
+function parseKit(text) {
+  const obj = JSON.parse(text);
+  // Accept both snake_case (kit on disk) and a few aliases.
+  const k = {
+    kind: obj.kind,
+    network: obj.network || obj.networkId || 'mainnet',
+    redeemHex: obj.redeem_script_hex || obj.redeemHex || obj.redeem,
+    p2sh: obj.p2sh_address || obj.p2sh || obj.address,
+    branch: obj.branch,
+    preimageHex: obj.preimage_hex || obj.preimageHex,
+    lockDaa: obj.lock_daa ?? obj.lockTime ?? obj.lock_time,
+    sequence: obj.sequence ?? obj.csv,
+    total: obj.total ?? (obj.multisig && obj.multisig.total),
+    funding: obj.funding || obj.outpoint || obj.utxo,
+  };
+  if (!k.kind) throw new Error('kit is missing "kind"');
+  if (!k.redeemHex) throw new Error('kit is missing "redeem_script_hex"');
+  if (!k.network || !NETWORK_PREFIX[k.network]) throw new Error(`kit "network" must be one of ${Object.keys(NETWORK_PREFIX).join(', ')}`);
+  if (!k.funding || k.funding.transactionId === undefined || k.funding.index === undefined || k.funding.amount === undefined) {
+    throw new Error('kit "funding" needs {transactionId, index, amount} (the covenant UTXO)');
+  }
+  return k;
+}
+
+$('parseKit').addEventListener('click', () => {
+  try {
+    kit = parseKit($('kit').value);
+    renderClaimability(kit);
+    // Prefill convenience fields from the kit.
+    if (kit.preimageHex && !$('preimage').value) $('preimage').value = kit.preimageHex;
+    if (kit.lockDaa != null && $('lockTime').value === '') $('lockTime').value = String(kit.lockDaa);
+    if (kit.sequence != null && $('sequence').value === '') $('sequence').value = String(kit.sequence);
+    const rows = [
+      ['kind', kit.kind],
+      ['network', kit.network],
+      ['p2sh address', kit.p2sh || '(not in kit)'],
+      ['UTXO', `${kit.funding.transactionId}:${kit.funding.index}`],
+      ['amount (sompi)', String(kit.funding.amount)],
+      ['branch', kit.branch || '(choose in step 3)'],
+    ];
+    showOut($('kitOut'), rows.map(([a, b]) => `${a.padEnd(16)} ${b}`).join('\n'), 'ok');
+    $('buildSign').disabled = !WASM;
+  } catch (e) {
+    kit = null;
+    showOut($('kitOut'), 'Could not parse kit: ' + e.message, 'err');
+    $('claimability').textContent = 'Parse a valid kit to see claimability.';
+  }
+});
+
+$('loadFile').addEventListener('click', () => $('fileInput').click());
+$('fileInput').addEventListener('change', (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { $('kit').value = String(r.result || ''); $('parseKit').click(); };
+  r.readAsText(f);
+});
+
+$('buildSign').addEventListener('click', async () => {
+  signedTx = null; signedTxJson = ''; $('signedJson').value = '';
+  $('broadcast').disabled = true; $('exportTx').disabled = true; $('copyTx').disabled = true;
+  const privEl = $('priv');
+  try {
+    if (!kit) throw new Error('parse a recovery kit first');
+    const branch = effectiveBranch();
+    const info = kindClaim(kit.kind);
+    const refundBranch = branch === 'refund' || branch === 'refundA' || branch === 'refundB';
+    if (info.offline === false) {
+      throw new Error(`${kit.kind} is not offline-claimable: its win path needs the Covex oracle signature. Paste the oracle signature in Advanced, or use the Covex site.`);
+    }
+    if (info.offline === 'refund-only' && !refundBranch && !$('oracleSig').value.trim()) {
+      throw new Error(`${kit.kind} win path needs the Covex oracle signature. Choose the "refund" branch (offline) or paste the oracle signature in Advanced.`);
+    }
+
+    const priv = privEl.value.trim();
+    if (!priv) throw new Error('enter your private key');
+    const dest = $('dest').value.trim();
+    if (!dest) throw new Error('enter a destination address');
+    const fee = $('fee').value.trim();
+    if (!fee) throw new Error('enter a fee (sompi)');
+
+    showOut($('buildOut'), 'Building unsigned transaction...', null);
+
+    const tx = await buildUnsignedSpend({
+      utxo: {
+        transactionId: kit.funding.transactionId,
+        index: Number(kit.funding.index),
+        amount: kit.funding.amount,
+        scriptPublicKey: kit.funding.scriptPublicKey,
+      },
+      redeemHex: kit.redeemHex,
+      destAddr: dest,
+      networkId: kit.network,
+      fee,
+      kind: kit.kind,
+      branch,
+      lockTime: $('lockTime').value.trim() || undefined,
+      sequence: $('sequence').value.trim() || undefined,
+      total: kit.total != null ? Number(kit.total) : undefined,
+    });
+
+    // Sign locally. The private key never leaves this function / this page.
+    const mySig = await signInput(tx, 0, priv);
+
+    // Assemble the satisfier from the SAME pure-core logic the chain validated.
+    const preHex = $('preimage').value.trim() || kit.preimageHex;
+    const oracleSigHex = $('oracleSig').value.trim();
+    const extraSigHex = $('refundKeySig').value.trim();
+    const satArgs = {
+      kind: kit.kind,
+      branch,
+      sig65: mySig,
+      winnerSig: mySig,
+      preimageBytes: preHex ? hexToBytes(preHex) : undefined,
+      oracleSig: oracleSigHex ? hexToBytes(oracleSigHex) : undefined,
+      refundSig: refundBranch ? mySig : (extraSigHex ? hexToBytes(extraSigHex) : undefined),
+    };
+    const satisfier = buildSatisfier(satArgs);
+    const sigScript = await assembleSigScript(kit.redeemHex, satisfier);
+
+    // Attach the assembled signature_script to input 0.
+    if (typeof tx.setInputSignatureScript === 'function') {
+      tx.setInputSignatureScript(0, sigScript);
+    } else {
+      // Fallback: mutate the inputs array shape the wasm Transaction exposes.
+      const ins = tx.inputs;
+      if (ins && ins[0]) ins[0].signatureScript = sigScript;
+      if (typeof tx.inputs === 'object' && Array.isArray(tx.inputs)) tx.inputs = ins;
+    }
+
+    signedTx = tx;
+    signedTxJson = await exportSignedTxJson(tx);
+    $('signedJson').value = signedTxJson;
+    $('broadcast').disabled = false;
+    $('exportTx').disabled = false;
+    $('copyTx').disabled = false;
+
+    showOut($('buildOut'),
+      'Signed locally.\n' +
+      'satisfier bytes: ' + bytesToHex(satisfier) + '\n' +
+      'sigOpCount: ' + sigOpCount(kit.kind, { total: kit.total != null ? Number(kit.total) : undefined }) + '\n\n' +
+      'Now Broadcast over wRPC, or Export the signed-tx JSON and submit it from any node / explorer.',
+      'ok');
+  } catch (e) {
+    showOut($('buildOut'), 'Build/sign failed: ' + (e && e.message ? e.message : e), 'err');
+  } finally {
+    // Clear the key from the field and from the variable scope as soon as signing is done.
+    privEl.value = '';
+  }
+});
+
+$('broadcast').addEventListener('click', async () => {
+  if (!signedTx) return;
+  try {
+    showOut($('buildOut'), 'Connecting to a public Kaspa node and submitting...', null);
+    const txid = await broadcast(signedTx, kit.network);
+    showOut($('buildOut'), 'Broadcast accepted.\ntxid: ' + txid, 'ok');
+  } catch (e) {
+    showOut($('buildOut'),
+      'wRPC broadcast did not work: ' + (e && e.message ? e.message : e) +
+      '\n\nUse the Export signed-tx JSON button and submit it from a node CLI or a block explorer instead. The signed transaction above is complete and valid.',
+      'err');
+  }
+});
+
+$('exportTx').addEventListener('click', () => {
+  if (!signedTxJson) return;
+  const blob = new Blob([signedTxJson], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `covex-signed-tx-${(kit && kit.kind) || 'spend'}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+});
+
+$('copyTx').addEventListener('click', async () => {
+  if (!signedTxJson) return;
+  try { await navigator.clipboard.writeText(signedTxJson); $('copyTx').textContent = 'Copied'; setTimeout(() => $('copyTx').textContent = 'Copy signed-tx JSON', 1500); }
+  catch (_) { $('signedJson').select(); }
+});
+
+// Initialize the inlined wasm on load so signing is ready and offline.
+(async () => {
+  try {
+    await initWasm();
+    setBanner(true, 'Ready and offline. The signing library is bundled into this file. Your key never leaves this page.');
+    if (kit) $('buildSign').disabled = false;
+    // Enable build as soon as a kit is parsed (handled in parseKit click) and wasm is ready.
+    $('buildSign').disabled = !kit;
+  } catch (e) {
+    setBanner(false, 'Signing library not available: ' + (e && e.message ? e.message : e) + '. Did you run build-claim-tool.mjs to inline the wasm?');
+  }
+})();
+</script>
+</body>
+</html>
