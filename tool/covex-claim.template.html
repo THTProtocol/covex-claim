@@ -113,14 +113,15 @@
     <div class="step">This is the JSON you saved when the covenant was created or funded. It contains everything except your private key.</div>
     <label for="kit">Recovery kit JSON</label>
     <textarea id="kit" spellcheck="false" placeholder='{
-  "kind": "binary_oracle_select",
-  "network": "mainnet",
-  "redeem_script_hex": "....",
-  "p2sh_address": "kaspa:....",
-  "funding": { "transactionId": "....", "index": 0, "amount": "100000000" },
-  "branch": "revealA",
-  "preimage_hex": "....",
-  "lock_daa": null
+  "covex_recovery_kit_version": 2,
+  "covenant": {
+    "network": "mainnet",
+    "p2sh_address": "kaspa:....",
+    "redeem_kind": "binary_oracle_select:144",
+    "redeem_script_hex": "....",
+    "lock_daa": null,
+    "revealed_secret": null
+  }
 }'></textarea>
     <div class="btnrow">
       <button class="btn" id="parseKit">Parse kit</button>
@@ -139,6 +140,10 @@
     <h2>3. Your inputs</h2>
     <label for="dest">Destination Kaspa address (where the funds go)</label>
     <input id="dest" spellcheck="false" placeholder="kaspa:... (or kaspatest:... on testnet)" />
+
+    <label for="utxo">Covenant UTXO (transactionId:index:amount in sompi)</label>
+    <input id="utxo" spellcheck="false" placeholder="prefilled from the kit if present; otherwise paste the funding UTXO" />
+    <div class="note">The recovery kit usually does not include the funding UTXO. Look it up by the P2SH address above on any Kaspa explorer, then paste it here as transactionId:index:amount.</div>
 
     <div class="row">
       <div>
@@ -330,8 +335,13 @@ function sigOpCount(kind, opts = {}) {
     case 'hashlock':
     case 'timelock':
     case 'rcsv':
-    case 'htlc':
       return 1;
+    // HTLC redeem has TWO CheckSig (claim branch + refund branch); the node statically sums
+    // sig-ops across BOTH IF/ELSE arms => 2. Declaring 1 made every HTLC spend (and offline
+    // cold-recovery claim) fail WrongSigOpCount(1, 2) and PERMANENTLY lock the funds. Mirrors
+    // the Rust SpendKind::Htlc.sig_op_count() of 2 (backend/src/covenant_builder.rs:649).
+    case 'htlc':
+      return 2;
     case 'deadman':
       return 2;
     case 'channel':
@@ -356,6 +366,30 @@ function sigOpCount(kind, opts = {}) {
   }
 }
 
+// Covenant kinds the offline claim tool does NOT (and in some cases CANNOT) assemble a
+// non-custodial satisfier for, paired with the honest, actionable reason. timedecay has no
+// non-custodial assembler even in the Rust backend; winner_bound / escrow_bound are not yet
+// ported; zk_game_settle (KIP-16 on-chain ZK) bakes a long verifying key and needs Groth16
+// proof bytes the standalone tool does not yet assemble. Detected EARLY so the user gets a
+// clear pointer to the in-app flow, never a fabricated satisfier or a generic stack trace.
+const UNSUPPORTED_KINDS = Object.freeze({
+  timedecay: 'timedecay (time-decaying multisig) has no non-custodial offline assembler.',
+  winner_bound: 'winner_bound is not yet supported by the offline assembler.',
+  escrow_bound: 'escrow_bound is not yet supported by the offline assembler.',
+  zk_game_settle: 'zk_game_settle (on-chain ZK settlement) is not yet supported by the offline assembler.',
+});
+
+function assertSupportedKind(kind) {
+  if (Object.prototype.hasOwnProperty.call(UNSUPPORTED_KINDS, kind)) {
+    throw new Error(
+      `This covenant kind (${kind}) is not yet supported by the offline claim tool. ` +
+      `Use the in-app claim flow at hightable.pro/recover while it is available, or wait ` +
+      `for an updated tool. (${UNSUPPORTED_KINDS[kind]})`,
+    );
+  }
+  return false;
+}
+
 function buildSatisfier(args) {
   const {
     kind,
@@ -370,6 +404,10 @@ function buildSatisfier(args) {
     preimageBytes,
     winnerIsA,
   } = args || {};
+
+  // Fail-closed on kinds the offline tool cannot assemble: throw the honest, actionable
+  // message (in-app flow) instead of inventing a satisfier or hitting the generic default.
+  assertSupportedKind(kind);
 
   // Map the high-level branch label to the Rust (branch_refund, winner_is_a) pair.
   // For kinds that read winnerIsA directly (escrow / bos) the explicit arg wins; the
@@ -539,6 +577,146 @@ function buildSatisfier(args) {
   return concatBytes(...parts.map((p) => (p instanceof Uint8Array ? p : Uint8Array.from(p))));
 }
 
+// Per-(kind, branch) map of WHICH parsed-pubkey index the chain will OpCheckSig for the
+// signer of that branch, plus how to parse the redeem (checksigOnly) to get that key. Copied
+// VERBATIM from src/covenantRedeemer.js (the SIGNER_INDEX_MAP / normalizeBranchLabel /
+// assertSignerForBranch trio); the standalone tool wires assertSignerForBranch into the
+// build/sign flow as a fail-closed named-key pre-check.
+//   parse order per kind (checksigOnly=true unless noted):
+//     singlesig/timelock/rcsv/hashlock -> [key]
+//     htlc                             -> [receiver, sender]
+//     deadman                          -> [owner, heir]
+//     channel                          -> [p1, p2, p1]   (close needs BOTH p1 and p2)
+//     multisig (checksigOnly=false)    -> [pk1, pk2, ... pkM]   (no fixed signer index)
+//     binary_oracle_select             -> [winner_a, winner_b, refund]
+//     oracle_escrow                    -> [oracle, a, b]
+//     oracle_escrow_refundable         -> [oracle, a, b, refund]
+//     oracle_enforced (checksigOnly=false) -> [oracle, winner]
+//     oracle_enforced_refundable (checksigOnly=false) -> [oracle, winner, refund]
+// A branch value is a single index, an array of indices (cooperative close, both required),
+// or 'anyKey' (an N-of-M multisig: the signer must be ONE OF the M committed keys).
+const SIGNER_INDEX_MAP = Object.freeze({
+  singlesig: { checksigOnly: true, branches: { claim: 0 } },
+  timelock: { checksigOnly: true, branches: { claim: 0 } },
+  rcsv: { checksigOnly: true, branches: { claim: 0 } },
+  hashlock: { checksigOnly: true, branches: { claim: 0 } },
+  htlc: { checksigOnly: true, branches: { claim: 0, refund: 1 } },
+  deadman: { checksigOnly: true, branches: { claim: 0, refund: 1 } },
+  // channel: refund is p1 (index 0); a cooperative close requires BOTH p1 and p2 sigs.
+  channel: { checksigOnly: true, branches: { refund: 0, close: [1, 0], closeA: [1, 0], closeB: [1, 0] } },
+  // multisig: `OP_required <pk1>..<pkM> OP_M OpCheckMultiSig`. The M keys are inside the
+  // CheckMultiSig (NOT each followed by a checksig op) -> parse with checksigOnly=false. There
+  // is no fixed signer slot, so the branch is 'anyKey': the signer must be ONE OF the M keys.
+  multisig: { checksigOnly: false, branches: { claim: 'anyKey' } },
+  binary_oracle_select: { checksigOnly: true, branches: { revealA: 0, revealB: 1, refund: 2 } },
+  oracle_escrow: { checksigOnly: true, branches: { revealA: 1, revealB: 2, closeA: 1, closeB: 2 } },
+  oracle_escrow_refundable: { checksigOnly: true, branches: { revealA: 1, revealB: 2, closeA: 1, closeB: 2, refund: 3 } },
+  // oracle_enforced / oracle: the [oracle, winner] keys live inside an N-of-M multisig, so the
+  // winner pubkey is NOT directly followed by a checksig op -> parse with checksigOnly=false.
+  oracle: { checksigOnly: false, branches: { claim: 1 } },
+  oracle_enforced: { checksigOnly: false, branches: { claim: 1 } },
+  oracle_enforced_refundable: { checksigOnly: false, branches: { claim: 1, refund: 2 } },
+});
+
+// Aliases so a caller can pass the same branch labels buildSatisfier accepts. 'close' /
+// 'reveal' default to the A side; an explicit A/B label is preferred for the branchy kinds.
+function normalizeBranchLabel(kind, branch) {
+  const b = branch || 'claim';
+  const entry = SIGNER_INDEX_MAP[kind];
+  if (!entry) return b;
+  if (entry.branches[b] !== undefined) return b;
+  // Map convenience synonyms to the canonical keys present in the map.
+  if (b === 'reveal' || b === 'revealA') return entry.branches.revealA !== undefined ? 'revealA' : (entry.branches.claim !== undefined ? 'claim' : b);
+  if (b === 'revealB') return entry.branches.revealB !== undefined ? 'revealB' : b;
+  if (b === 'close' || b === 'closeA') return entry.branches.closeA !== undefined ? 'closeA' : (entry.branches.close !== undefined ? 'close' : b);
+  if (b === 'closeB') return entry.branches.closeB !== undefined ? 'closeB' : b;
+  if (b === 'refundA' || b === 'refundB') return entry.branches.refund !== undefined ? 'refund' : b;
+  // 'claim' is the generic single-signer label; fall back to the first non-refund branch.
+  if (b === 'claim') {
+    if (entry.branches.claim !== undefined) return 'claim';
+    if (entry.branches.revealA !== undefined) return 'revealA';
+  }
+  return b;
+}
+
+// FAIL-CLOSED named-key binding. Before signing, prove the x-only pubkey the user is about to
+// sign with is the EXACT key the chain will OpCheckSig on the chosen (kind, branch). Pure;
+// parses the redeem and compares bytes. No wasm, no network.
+function assertSignerForBranch(redeemHex, kind, branch, signerXonlyHex) {
+  const entry = SIGNER_INDEX_MAP[kind];
+  if (!entry) {
+    throw new Error(`assertSignerForBranch: unsupported kind '${kind}'`);
+  }
+  const label = normalizeBranchLabel(kind, branch);
+  const idxSpec = entry.branches[label];
+  if (idxSpec === undefined) {
+    throw new Error(`assertSignerForBranch: kind '${kind}' has no branch '${branch}'`);
+  }
+
+  let signer;
+  try {
+    signer = hexToBytes(signerXonlyHex);
+  } catch (e) {
+    throw new Error(`assertSignerForBranch: signer pubkey is not valid hex (${e.message})`);
+  }
+  if (signer.length !== 32) {
+    throw new Error(`assertSignerForBranch: signer x-only pubkey must be 32 bytes, got ${signer.length}`);
+  }
+
+  const redeem = hexToBytes(redeemHex);
+  const keys = parseRedeemPubkeys(redeem, entry.checksigOnly);
+
+  const eq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+  const signerArr = Array.from(signer);
+
+  // multisig (and any other 'anyKey' branch): there is no fixed signer slot. Prove the signer
+  // is ONE OF the M committed keys (an N-of-M co-signer); a wholly-foreign key fails closed.
+  if (idxSpec === 'anyKey') {
+    if (keys.length === 0) {
+      throw new Error(
+        `assertSignerForBranch: redeem for '${kind}' parsed 0 key(s) (wrong kind, wrong checksigOnly, or truncated redeem)`,
+      );
+    }
+    for (let i = 0; i < keys.length; i++) {
+      if (eq(Array.from(keys[i]), signerArr)) {
+        return { index: i, namedKeyHex: bytesToHex(keys[i]) };
+      }
+    }
+    throw new Error(
+      `assertSignerForBranch: your key ${bytesToHex(signer)} is NOT one of the ${keys.length} committed ${kind} keys. The chain only checks signatures from the committed key set. Use one of the committed keys.`,
+    );
+  }
+
+  const wantIndices = Array.isArray(idxSpec) ? idxSpec : [idxSpec];
+  const maxIdx = Math.max(...wantIndices);
+  if (keys.length <= maxIdx) {
+    throw new Error(
+      `assertSignerForBranch: redeem for '${kind}' parsed ${keys.length} key(s), need index ${maxIdx} (wrong kind, wrong checksigOnly, or truncated redeem)`,
+    );
+  }
+
+  for (const i of wantIndices) {
+    if (eq(Array.from(keys[i]), signerArr)) {
+      return { index: i, namedKeyHex: bytesToHex(keys[i]) };
+    }
+  }
+
+  // Not the named key. Report WHICH key the chain expects so the holder sees they have the
+  // wrong key/branch, without leaking anything secret (these pubkeys are public on-chain).
+  const expected = wantIndices.map((i) => `#${i}=${bytesToHex(keys[i])}`).join(' or ');
+  throw new Error(
+    `assertSignerForBranch: your key ${bytesToHex(signer)} is NOT the ${kind} ${label} signer. The chain checks ${expected} on this branch. Use the correct key, or the correct branch.`,
+  );
+}
+
+// Canonical kind-base normalizer. The exported recovery kit stores redeem_kind as
+// `<kind>:<suffix>` (e.g. htlc:1234, rcsv:10, multisig:3); every table here keys on the bare
+// kind. Strips any `:<suffix>`, lower-cases, folds relative_timelock -> rcsv. Pure.
+function canonicalKindBase(kind) {
+  const base = String(kind || '').split(':')[0].toLowerCase();
+  return base === 'relative_timelock' ? 'rcsv' : base;
+}
+
 // ===========================================================================
 // (B) STANDALONE WASM GLUE + TX PLUMBING. These talk to the INLINED kaspa-wasm
 //     (window.__KASPA_WASM__) - no module fetch, no Covex, no network for signing.
@@ -643,6 +821,9 @@ async function buildUnsignedSpend(p) {
     throw new Error(`destination ${p.destAddr} is not a ${p.networkId} address (expected ${prefix})`);
   }
 
+  // Fail-closed on a kind the offline tool cannot assemble (before any wasm work).
+  assertSupportedKind(p.kind);
+
   const utxoAmount = BigInt(p.utxo.amount);
   const fee = BigInt(p.fee);
   if (fee <= 0n) throw new Error('fee must be positive');
@@ -650,6 +831,25 @@ async function buildUnsignedSpend(p) {
   const MIN_SPENDABLE = 1000n;
   if (value < MIN_SPENDABLE) {
     throw new Error(`output (utxo ${utxoAmount} - fee ${fee} = ${value}) is below the spendable floor`);
+  }
+
+  // Couple lockTime / sequence to kind + branch (mirrors src/covenantRedeemer.js). The backend
+  // derives and commits these in the sighash; a missing CLTV/CSV operand otherwise only fails
+  // late at the node. Fail fast here instead so a blank sequence/lockTime never burns a fee.
+  const isRefundBranch = p.branch === 'refund' || p.branch === 'refundA' || p.branch === 'refundB';
+  const hasLockTime = p.lockTime !== undefined && p.lockTime !== '' && BigInt(p.lockTime) > 0n;
+  const hasSequence = p.sequence !== undefined && p.sequence !== '' && BigInt(p.sequence) > 0n;
+  const needsLockTime = p.kind === 'timelock'
+    || (p.kind === 'htlc' && isRefundBranch)
+    || (p.kind === 'channel' && isRefundBranch)
+    || (p.kind === 'deadman' && isRefundBranch); // heir / ELSE is the CLTV branch
+  const needsSequence = p.kind === 'rcsv'
+    || (p.kind === 'binary_oracle_select' && isRefundBranch);
+  if (needsLockTime && !hasLockTime) {
+    throw new Error(`${p.kind} ${p.branch || ''} requires a positive lockTime (CLTV)`);
+  }
+  if (needsSequence && !hasSequence) {
+    throw new Error(`${p.kind} ${p.branch || ''} requires a positive sequence (CSV)`);
   }
 
   const redeem = hexToBytes(p.redeemHex);
@@ -688,6 +888,24 @@ async function buildUnsignedSpend(p) {
     gas: 0n,
     payload: new Uint8Array(0),
   });
+}
+
+// Derive the 32-byte x-only (schnorr) pubkey for a private key, LOCALLY. The key never leaves
+// this function. Used by the build/sign flow's fail-closed assertSignerForBranch pre-check.
+async function deriveXonlyPubkey(privKeyHex) {
+  const k = await initWasm();
+  const { PrivateKey } = k;
+  const pk = new PrivateKey(privKeyHex);
+  try {
+    const xpub = pk.toXOnlyPublicKey
+      ? pk.toXOnlyPublicKey()
+      : (pk.toPublicKey && pk.toPublicKey().toXOnlyPublicKey ? pk.toPublicKey().toXOnlyPublicKey() : null);
+    if (!xpub) throw new Error('could not derive an x-only pubkey from this key');
+    const s = (xpub.toString ? xpub.toString() : String(xpub)).replace(/^0x/i, '');
+    return s.length === 66 ? s.slice(2) : s; // strip a 02/03 compressed prefix if present
+  } finally {
+    if (pk && typeof pk.free === 'function') pk.free();
+  }
 }
 
 // Produce the 64-byte BIP340 signature for input idx, key held only here.
@@ -803,6 +1021,14 @@ function showOut(el, text, cls) {
 }
 
 function kindClaim(kind) {
+  // Kinds the offline tool cannot assemble get an honest, actionable message (not a generic
+  // "needs Covex oracle"); the build/sign flow blocks them and points at the in-app flow.
+  if (Object.prototype.hasOwnProperty.call(UNSUPPORTED_KINDS, kind)) {
+    return {
+      offline: 'unsupported',
+      note: `This covenant kind (${kind}) is not yet supported by the offline claim tool. Use the in-app claim flow at hightable.pro/recover while it is available, or wait for an updated tool.`,
+    };
+  }
   return CLAIMABILITY[kind] || { offline: false, note: `Unknown kind '${kind}'. This tool only supports the Covex covenant kinds.` };
 }
 
@@ -812,6 +1038,7 @@ function renderClaimability(k) {
   let pill;
   if (info.offline === true) pill = '<span class="pill ok">offline-claimable</span>';
   else if (info.offline === 'refund-only') pill = '<span class="pill warn">refund branch only (offline)</span>';
+  else if (info.offline === 'unsupported') pill = '<span class="pill danger">not supported by this tool</span>';
   else pill = '<span class="pill danger">NOT offline-claimable (needs Covex oracle)</span>';
   el.innerHTML = `<div style="margin-bottom:6px">${pill} <span class="mono">${k.kind}</span></div><div class="note">${info.note}</div>`;
 }
@@ -822,28 +1049,61 @@ function effectiveBranch() {
   return (kit && kit.branch) || undefined;
 }
 
+// Parse a Covex recovery kit into the normalized shape the claim flow consumes. Mirrors
+// src/covenantRedeemer.js parseKit. Accepts BOTH the canonical NESTED v2 export
+// ({ covex_recovery_kit_version: 2, covenant: { p2sh_address, redeem_kind:'<kind>:<suffix>',
+// redeem_script_hex, lock_daa, network, ... } }, NO funding) AND older FLAT kits
+// ({ kind, network, redeem_script_hex, p2sh_address, funding, ... }). The kind is folded to
+// its bare base (any :suffix stripped, relative_timelock -> rcsv); funding is OPTIONAL.
 function parseKit(text) {
-  const obj = JSON.parse(text);
-  // Accept both snake_case (kit on disk) and a few aliases.
+  const obj = typeof text === 'string' ? JSON.parse(text) : text;
+  if (!obj || typeof obj !== 'object') throw new Error('kit is not an object');
+  // Unwrap the nested v2 envelope when present; fall back to a flat object for older kits.
+  const c = (obj.covenant && typeof obj.covenant === 'object') ? obj.covenant : obj;
+
+  const rawKind = c.redeem_kind || c.kind;
   const k = {
-    kind: obj.kind,
-    network: obj.network || obj.networkId || 'mainnet',
-    redeemHex: obj.redeem_script_hex || obj.redeemHex || obj.redeem,
-    p2sh: obj.p2sh_address || obj.p2sh || obj.address,
-    branch: obj.branch,
-    preimageHex: obj.preimage_hex || obj.preimageHex,
-    lockDaa: obj.lock_daa ?? obj.lockTime ?? obj.lock_time,
-    sequence: obj.sequence ?? obj.csv,
-    total: obj.total ?? (obj.multisig && obj.multisig.total),
-    funding: obj.funding || obj.outpoint || obj.utxo,
+    kind: canonicalKindBase(rawKind),
+    network: c.network || c.networkId || obj.network || 'mainnet',
+    redeemHex: c.redeem_script_hex || c.redeemHex || c.redeem,
+    p2sh: c.p2sh_address || c.p2sh || c.address || null,
+    branch: c.branch || obj.branch,
+    preimageHex: c.preimage_hex || c.preimageHex || c.revealed_secret || c.preimage,
+    lockDaa: c.lock_daa ?? c.lockTime ?? c.lock_time ?? null,
+    sequence: c.sequence ?? c.csv,
+    total: c.total ?? (c.multisig && c.multisig.total),
+    // Funding is OPTIONAL (the canonical v2 kit has none): when absent, the user pastes a UTXO
+    // as transactionId:index:amount (or it is fetched by p2sh_address) in step 3.
+    funding: c.funding || c.outpoint || c.utxo || obj.funding || null,
   };
-  if (!k.kind) throw new Error('kit is missing "kind"');
+  if (!k.kind) throw new Error('kit is missing "kind" / "redeem_kind"');
   if (!k.redeemHex) throw new Error('kit is missing "redeem_script_hex"');
   if (!k.network || !NETWORK_PREFIX[k.network]) throw new Error(`kit "network" must be one of ${Object.keys(NETWORK_PREFIX).join(', ')}`);
-  if (!k.funding || k.funding.transactionId === undefined || k.funding.index === undefined || k.funding.amount === undefined) {
-    throw new Error('kit "funding" needs {transactionId, index, amount} (the covenant UTXO)');
+  // Validate funding ONLY when present; absent funding is allowed (paste a UTXO in step 3).
+  if (k.funding) {
+    const f = k.funding;
+    if (f.transactionId === undefined && f.txid !== undefined) f.transactionId = f.txid;
+    if (!f.transactionId) throw new Error('kit "funding" needs a transactionId');
+    const idx = Number(f.index);
+    if (!Number.isInteger(idx) || idx < 0) throw new Error('kit "funding.index" must be an integer >= 0');
+    f.index = idx;
+    const amtStr = String(f.amount);
+    if (!/^\d+$/.test(amtStr) || BigInt(amtStr) <= 0n) throw new Error('kit "funding.amount" must be a positive integer (sompi)');
   }
   return k;
+}
+
+// Parse a user-pasted UTXO string "transactionId:index:amount" into a funding object. Used
+// when the kit carries no funding (the canonical v2 kit). Validates the same way parseKit does.
+function parseUtxoString(s) {
+  const parts = String(s || '').trim().split(':');
+  if (parts.length !== 3) throw new Error('paste the UTXO as transactionId:index:amount');
+  const [transactionId, indexStr, amountStr] = parts.map((p) => p.trim());
+  if (!transactionId) throw new Error('UTXO transactionId is empty');
+  const index = Number(indexStr);
+  if (!Number.isInteger(index) || index < 0) throw new Error('UTXO index must be an integer >= 0');
+  if (!/^\d+$/.test(amountStr) || BigInt(amountStr) <= 0n) throw new Error('UTXO amount must be a positive integer (sompi)');
+  return { transactionId, index, amount: amountStr };
 }
 
 $('parseKit').addEventListener('click', () => {
@@ -854,16 +1114,24 @@ $('parseKit').addEventListener('click', () => {
     if (kit.preimageHex && !$('preimage').value) $('preimage').value = kit.preimageHex;
     if (kit.lockDaa != null && $('lockTime').value === '') $('lockTime').value = String(kit.lockDaa);
     if (kit.sequence != null && $('sequence').value === '') $('sequence').value = String(kit.sequence);
+    // Prefill the UTXO field from the kit when it carries funding; otherwise the user pastes it.
+    if (kit.funding && $('utxo').value === '') {
+      $('utxo').value = `${kit.funding.transactionId}:${kit.funding.index}:${kit.funding.amount}`;
+    }
+    const utxoLabel = kit.funding
+      ? `${kit.funding.transactionId}:${kit.funding.index} (${String(kit.funding.amount)} sompi)`
+      : '(not in kit - paste it in step 3)';
     const rows = [
       ['kind', kit.kind],
       ['network', kit.network],
       ['p2sh address', kit.p2sh || '(not in kit)'],
-      ['UTXO', `${kit.funding.transactionId}:${kit.funding.index}`],
-      ['amount (sompi)', String(kit.funding.amount)],
+      ['UTXO', utxoLabel],
       ['branch', kit.branch || '(choose in step 3)'],
     ];
     showOut($('kitOut'), rows.map(([a, b]) => `${a.padEnd(16)} ${b}`).join('\n'), 'ok');
-    $('buildSign').disabled = !WASM;
+    const info = kindClaim(kit.kind);
+    // An unsupported kind cannot be assembled here: keep Build disabled and say why.
+    $('buildSign').disabled = !WASM || info.offline === 'unsupported';
   } catch (e) {
     kit = null;
     showOut($('kitOut'), 'Could not parse kit: ' + e.message, 'err');
@@ -889,6 +1157,10 @@ $('buildSign').addEventListener('click', async () => {
     const branch = effectiveBranch();
     const info = kindClaim(kit.kind);
     const refundBranch = branch === 'refund' || branch === 'refundA' || branch === 'refundB';
+    // Kinds the offline tool cannot assemble: stop with the honest in-app-flow message.
+    if (info.offline === 'unsupported') {
+      throw new Error(`This covenant kind (${kit.kind}) is not yet supported by the offline claim tool. Use the in-app claim flow at hightable.pro/recover while it is available, or wait for an updated tool.`);
+    }
     if (info.offline === false) {
       throw new Error(`${kit.kind} is not offline-claimable: its win path needs the Covex oracle signature. Paste the oracle signature in Advanced, or use the Covex site.`);
     }
@@ -903,14 +1175,31 @@ $('buildSign').addEventListener('click', async () => {
     const fee = $('fee').value.trim();
     if (!fee) throw new Error('enter a fee (sompi)');
 
-    showOut($('buildOut'), 'Building unsigned transaction...', null);
+    // Resolve the funding UTXO: the pasted field (if filled) takes precedence over the kit,
+    // since the canonical v2 kit carries no funding and the user supplies the UTXO here.
+    const utxoText = $('utxo').value.trim();
+    let funding;
+    if (utxoText) funding = parseUtxoString(utxoText);
+    else if (kit.funding) funding = kit.funding;
+    else throw new Error('this kit has no funding UTXO: paste it as transactionId:index:amount in step 3 (look it up by the P2SH address on any explorer)');
+
+    // FAIL-CLOSED named-key binding: prove the key is the chain-checked key for this branch
+    // BEFORE signing, so a wrong key / wrong branch fails fast (no wasted fee on a doomed tx).
+    // Skip only for kinds with no SIGNER_INDEX_MAP entry (none here once unsupported is gated).
+    if (SIGNER_INDEX_MAP[kit.kind]) {
+      const xonly = await deriveXonlyPubkey(priv);
+      const bound = assertSignerForBranch(kit.redeemHex, kit.kind, branch || 'claim', xonly);
+      showOut($('buildOut'), `Key bound to the ${kit.kind} ${branch || 'claim'} signer (#${bound.index}). Building unsigned transaction...`, null);
+    } else {
+      showOut($('buildOut'), 'Building unsigned transaction...', null);
+    }
 
     const tx = await buildUnsignedSpend({
       utxo: {
-        transactionId: kit.funding.transactionId,
-        index: Number(kit.funding.index),
-        amount: kit.funding.amount,
-        scriptPublicKey: kit.funding.scriptPublicKey,
+        transactionId: funding.transactionId,
+        index: Number(funding.index),
+        amount: funding.amount,
+        scriptPublicKey: funding.scriptPublicKey,
       },
       redeemHex: kit.redeemHex,
       destAddr: dest,
@@ -1010,9 +1299,10 @@ $('copyTx').addEventListener('click', async () => {
   try {
     await initWasm();
     setBanner(true, 'Ready and offline. The signing library is bundled into this file. Your key never leaves this page.');
-    if (kit) $('buildSign').disabled = false;
-    // Enable build as soon as a kit is parsed (handled in parseKit click) and wasm is ready.
-    $('buildSign').disabled = !kit;
+    // Enable build once a kit is parsed and wasm is ready, UNLESS the kit's kind is one this
+    // tool cannot assemble (handled the same way in the parseKit click handler).
+    const unsupported = kit && kindClaim(kit.kind).offline === 'unsupported';
+    $('buildSign').disabled = !kit || unsupported;
   } catch (e) {
     setBanner(false, 'Signing library not available: ' + (e && e.message ? e.message : e) + '. Did you run build-claim-tool.mjs to inline the wasm?');
   }

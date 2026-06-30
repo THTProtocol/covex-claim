@@ -220,8 +220,8 @@ export function parseRedeemPubkeys(redeem, checksigOnly) {
  * Kaspa counts a CheckMultiSig as one sig-op per LISTED pubkey, and each
  * CheckSig / CheckSigVerify as one.
  *
- *   singlesig | hashlock | timelock | rcsv | htlc        -> 1
- *   deadman                                              -> 2 (one CheckSig per branch)
+ *   singlesig | hashlock | timelock | rcsv               -> 1
+ *   htlc | deadman                                       -> 2 (one CheckSig per IF/ELSE branch)
  *   channel | oracle_escrow | binary_oracle_select       -> 3
  *   oracle_enforced_refundable                           -> 3 (2 multisig + 1 refund)
  *   oracle_escrow_refundable                             -> 4 (oracle + a + b + refund)
@@ -238,8 +238,13 @@ export function sigOpCount(kind, opts = {}) {
     case 'hashlock':
     case 'timelock':
     case 'rcsv':
-    case 'htlc':
       return 1;
+    // HTLC redeem has TWO CheckSig (claim branch + refund branch); the node statically sums
+    // sig-ops across BOTH IF/ELSE arms => 2. Declaring 1 made every HTLC spend (and offline
+    // cold-recovery claim) fail WrongSigOpCount(1, 2) and PERMANENTLY lock the funds. Mirrors
+    // the Rust SpendKind::Htlc.sig_op_count() of 2 (backend/src/covenant_builder.rs:649).
+    case 'htlc':
+      return 2;
     case 'deadman':
       return 2;
     case 'channel':
@@ -262,6 +267,50 @@ export function sigOpCount(kind, opts = {}) {
     default:
       throw new Error(`sigOpCount: unsupported kind '${kind}'`);
   }
+}
+
+/**
+ * Covenant kinds the offline claim tool does NOT (and in some cases CANNOT) assemble a
+ * non-custodial satisfier for, paired with the honest, actionable reason.
+ *
+ *   timedecay      - a time-decaying multisig (two real multisigs spliced into an IF/ELSE).
+ *                    There is no non-custodial satisfier assembler for it even in the Rust
+ *                    backend, so we cannot safely build one here.
+ *   winner_bound   - winner-bound payout kind not yet ported to the offline assembler.
+ *   escrow_bound   - escrow-bound payout kind not yet ported to the offline assembler.
+ *   zk_game_settle - KIP-16 on-chain ZK settlement: its redeem bakes a long arbitrary
+ *                    verifying key, and the winner branch needs Groth16 proof bytes. The
+ *                    standalone offline tool does not yet assemble this; use the in-app flow.
+ *
+ * These are detected EARLY (before sigOpCount / buildSatisfier / signing) so the user gets a
+ * clear pointer to the in-app flow instead of a generic "unsupported kind" stack trace or,
+ * worse, a fabricated satisfier that would burn a fee on a doomed (or wrong) spend.
+ */
+export const UNSUPPORTED_KINDS = Object.freeze({
+  timedecay: 'timedecay (time-decaying multisig) has no non-custodial offline assembler.',
+  winner_bound: 'winner_bound is not yet supported by the offline assembler.',
+  escrow_bound: 'escrow_bound is not yet supported by the offline assembler.',
+  zk_game_settle: 'zk_game_settle (on-chain ZK settlement) is not yet supported by the offline assembler.',
+});
+
+/**
+ * If `kind` is one of the kinds the offline tool cannot yet assemble, throw a clear,
+ * actionable error pointing the holder at the in-app claim flow. Returns false (no throw)
+ * for every supported kind so callers can use it as an early gate. Pure; no wasm, no network.
+ *
+ * @param {string} kind - base kind string (suffix already stripped)
+ * @returns {false} when the kind is supported (callers may ignore the return value)
+ * @throws {Error} with an honest message when the kind is unsupported by this tool
+ */
+export function assertSupportedKind(kind) {
+  if (Object.prototype.hasOwnProperty.call(UNSUPPORTED_KINDS, kind)) {
+    throw new Error(
+      `This covenant kind (${kind}) is not yet supported by the offline claim tool. ` +
+      `Use the in-app claim flow at hightable.pro/recover while it is available, or wait ` +
+      `for an updated tool. (${UNSUPPORTED_KINDS[kind]})`,
+    );
+  }
+  return false;
 }
 
 /**
@@ -305,6 +354,10 @@ export function buildSatisfier(args) {
     preimageBytes,
     winnerIsA,
   } = args || {};
+
+  // Fail-closed on kinds the offline tool cannot assemble: throw the honest, actionable
+  // message (in-app flow) instead of inventing a satisfier or hitting the generic default.
+  assertSupportedKind(kind);
 
   // Map the high-level branch label to the Rust (branch_refund, winner_is_a) pair.
   // For kinds that read winnerIsA directly (escrow / bos) the explicit arg wins; the
@@ -489,14 +542,21 @@ export function buildSatisfier(args) {
  *     htlc                             -> [receiver, sender]
  *     deadman                          -> [owner, heir]
  *     channel                          -> [p1, p2, p1]   (close needs BOTH p1 and p2)
+ *     multisig (checksigOnly=false)    -> [pk1, pk2, ... pkM]   (no fixed signer index)
  *     binary_oracle_select             -> [winner_a, winner_b, refund]
  *     oracle_escrow                    -> [oracle, a, b]
  *     oracle_escrow_refundable         -> [oracle, a, b, refund]
  *     oracle_enforced (checksigOnly=false) -> [oracle, winner]
  *     oracle_enforced_refundable (checksigOnly=false) -> [oracle, winner, refund]
  *
- * A value is either a single number (the index the named signer's key sits at) or, for a
- * cooperative-close branch with two required signers, an array of indices (both expected).
+ * A branch value is either a single number (the index the named signer's key sits at), an
+ * array of indices (a cooperative-close branch with two required signers, both expected), or
+ * the marker `'anyKey'`. `'anyKey'` is for an N-of-M multisig whose redeem is
+ * `OP_required <pk1> .. <pkM> OP_M OpCheckMultiSig`: the keys sit INSIDE the CheckMultiSig
+ * (none directly followed by a checksig op, so checksigOnly=false), and there is no single
+ * "the signer must be index X" - any of the M committed keys is a valid co-signer. The check
+ * therefore only proves the signer is ONE OF the committed keys (catches a wholly-foreign key
+ * before a fee is spent), without asserting a particular slot.
  */
 const SIGNER_INDEX_MAP = Object.freeze({
   singlesig: { checksigOnly: true, branches: { claim: 0 } },
@@ -507,6 +567,10 @@ const SIGNER_INDEX_MAP = Object.freeze({
   deadman: { checksigOnly: true, branches: { claim: 0, refund: 1 } },
   // channel: refund is p1 (index 0); a cooperative close requires BOTH p1 and p2 sigs.
   channel: { checksigOnly: true, branches: { refund: 0, close: [1, 0], closeA: [1, 0], closeB: [1, 0] } },
+  // multisig: `OP_required <pk1>..<pkM> OP_M OpCheckMultiSig`. The M keys are inside the
+  // CheckMultiSig (NOT each followed by a checksig op) -> parse with checksigOnly=false. There
+  // is no fixed signer slot, so the branch is 'anyKey': the signer must be ONE OF the M keys.
+  multisig: { checksigOnly: false, branches: { claim: 'anyKey' } },
   binary_oracle_select: { checksigOnly: true, branches: { revealA: 0, revealB: 1, refund: 2 } },
   oracle_escrow: { checksigOnly: true, branches: { revealA: 1, revealB: 2, closeA: 1, closeB: 2 } },
   oracle_escrow_refundable: { checksigOnly: true, branches: { revealA: 1, revealB: 2, closeA: 1, closeB: 2, refund: 3 } },
@@ -582,6 +646,25 @@ export function assertSignerForBranch(redeemHex, kind, branch, signerXonlyHex) {
 
   const eq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
   const signerArr = Array.from(signer);
+
+  // multisig (and any other 'anyKey' branch): there is no fixed signer slot. Prove the signer
+  // is ONE OF the M committed keys (an N-of-M co-signer); a wholly-foreign key fails closed.
+  if (idxSpec === 'anyKey') {
+    if (keys.length === 0) {
+      throw new Error(
+        `assertSignerForBranch: redeem for '${kind}' parsed 0 key(s) (wrong kind, wrong checksigOnly, or truncated redeem)`,
+      );
+    }
+    for (let i = 0; i < keys.length; i++) {
+      if (eq(Array.from(keys[i]), signerArr)) {
+        return { index: i, namedKeyHex: bytesToHex(keys[i]) };
+      }
+    }
+    throw new Error(
+      `assertSignerForBranch: your key ${bytesToHex(signer)} is NOT one of the ${keys.length} committed ${kind} keys. The chain only checks signatures from the committed key set. Use one of the committed keys.`,
+    );
+  }
+
   const wantIndices = Array.isArray(idxSpec) ? idxSpec : [idxSpec];
   const maxIdx = Math.max(...wantIndices);
   if (keys.length <= maxIdx) {
@@ -602,6 +685,88 @@ export function assertSignerForBranch(redeemHex, kind, branch, signerXonlyHex) {
   throw new Error(
     `assertSignerForBranch: your key ${bytesToHex(signer)} is NOT the ${kind} ${label} signer. The chain checks ${expected} on this branch. Use the correct key, or the correct branch.`,
   );
+}
+
+/**
+ * Canonical kind-base normalizer (single source of truth for kind aliases). The exported
+ * recovery kit stores `redeem_kind` as `<kind>:<suffix>` (e.g. `htlc:1234`, `rcsv:10`,
+ * `multisig:3`); every table in this module keys on the BARE kind. Strips any `:<suffix>`,
+ * lower-cases, and folds the deploy-wizard alias `relative_timelock` -> `rcsv` (so a covenant
+ * deployed as relative_timelock recovers instead of silently failing). Pure.
+ *
+ * @param {string} kind - a kind string, with or without a `:<suffix>` (e.g. 'rcsv:10').
+ * @returns {string} the canonical base kind every table here keys on.
+ */
+export function canonicalKindBase(kind) {
+  const base = String(kind || '').split(':')[0].toLowerCase();
+  return base === 'relative_timelock' ? 'rcsv' : base;
+}
+
+/**
+ * Parse a Covex recovery kit into the normalized shape the claim flow consumes. Pure: just
+ * shape + validation, no wasm and no network.
+ *
+ * Accepts BOTH kit layouts:
+ *   - The canonical NESTED v2 export (RecoveryKitModal / Recover.normalizeKit):
+ *       { covex_recovery_kit_version: 2, covenant: { p2sh_address, redeem_kind:'<kind>:<suffix>',
+ *         redeem_script_hex, lock_daa, network, revealed_secret, ... } }   (NO funding field)
+ *   - Older FLAT kits: { kind, network, redeem_script_hex, p2sh_address, funding, ... }
+ *
+ * The `redeem_kind`/`kind` is folded to its bare base via canonicalKindBase (any `:suffix`
+ * stripped, relative_timelock -> rcsv). `funding` is OPTIONAL: the canonical v2 kit carries no
+ * UTXO, so the caller fetches the UTXO by p2sh_address or the user pastes one. When funding IS
+ * present, transactionId must be set, index an integer >= 0, and amount a positive integer.
+ *
+ * @param {string|object} input - the kit JSON text, or an already-parsed kit object.
+ * @returns {{kind:string, network:string, redeemHex:string, p2sh:(string|null),
+ *           branch:(string|undefined), preimageHex:(string|undefined),
+ *           lockDaa:(any), sequence:(any), total:(any), funding:(object|null)}}
+ * @throws {Error} on invalid JSON, a missing kind / redeem script / network, or malformed funding.
+ */
+export function parseKit(input) {
+  const obj = typeof input === 'string' ? JSON.parse(input) : input;
+  if (!obj || typeof obj !== 'object') throw new Error('kit is not an object');
+  // Unwrap the nested v2 envelope when present; fall back to a flat object for older kits.
+  const c = (obj.covenant && typeof obj.covenant === 'object') ? obj.covenant : obj;
+
+  const rawKind = c.redeem_kind || c.kind;
+  const kind = canonicalKindBase(rawKind);
+  const k = {
+    kind,
+    network: c.network || c.networkId || obj.network || 'mainnet',
+    redeemHex: c.redeem_script_hex || c.redeemHex || c.redeem,
+    p2sh: c.p2sh_address || c.p2sh || c.address || null,
+    branch: c.branch || obj.branch,
+    preimageHex: c.preimage_hex || c.preimageHex || c.revealed_secret || c.preimage,
+    lockDaa: c.lock_daa ?? c.lockTime ?? c.lock_time ?? null,
+    sequence: c.sequence ?? c.csv,
+    total: c.total ?? (c.multisig && c.multisig.total),
+    // Funding is OPTIONAL (the canonical v2 kit has none); accept several aliases when present.
+    funding: c.funding || c.outpoint || c.utxo || obj.funding || null,
+  };
+
+  if (!k.kind) throw new Error('kit is missing "kind" / "redeem_kind"');
+  if (!k.redeemHex) throw new Error('kit is missing "redeem_script_hex"');
+  if (!k.network) throw new Error('kit is missing "network"');
+
+  // Validate funding ONLY when present; absent funding is allowed (fetch by p2sh / paste a UTXO).
+  if (k.funding) {
+    const f = k.funding;
+    if (f.transactionId === undefined && f.txid !== undefined) f.transactionId = f.txid;
+    if (!f.transactionId) throw new Error('kit "funding" needs a transactionId');
+    const idx = Number(f.index);
+    if (!Number.isInteger(idx) || idx < 0) {
+      throw new Error('kit "funding.index" must be an integer >= 0');
+    }
+    f.index = idx;
+    // amount may arrive as a string (BigInt-safe) or a number; require a positive integer.
+    const amtStr = String(f.amount);
+    if (!/^\d+$/.test(amtStr) || BigInt(amtStr) <= 0n) {
+      throw new Error('kit "funding.amount" must be a positive integer (sompi)');
+    }
+  }
+
+  return k;
 }
 
 /**
@@ -803,7 +968,10 @@ export async function buildUnsignedSpend(p) {
   }
 
   const k = await loadWasm();
-  const { Transaction, payToScriptHashScript, addressToScriptPublicKey } = k;
+  // @onekeyfe/kaspa-wasm exposes the address -> scriptPublicKey helper as
+  // payToAddressScript(address); addressToScriptPublicKey is NOT exported in this build (using
+  // it threw "addressToScriptPublicKey is not a function" and the spend never assembled).
+  const { Transaction, payToScriptHashScript, payToAddressScript } = k;
 
   const redeem = hexToBytes(p.redeemHex);
   // P2SH script the UTXO is locked to (what the sighash must commit as the input's spk).
@@ -812,16 +980,21 @@ export async function buildUnsignedSpend(p) {
   const ops = sigOpCount(p.kind, { total: p.total });
   const seq = p.sequence !== undefined ? BigInt(p.sequence) : 0n;
 
+  const outpoint = {
+    transactionId: p.utxo.transactionId,
+    index: p.utxo.index >>> 0,
+  };
   const input = {
-    previousOutpoint: {
-      transactionId: p.utxo.transactionId,
-      index: p.utxo.index >>> 0,
-    },
+    previousOutpoint: outpoint,
     signatureScript: new Uint8Array(0), // filled by assembleSigScript after signing
     sequence: seq,
     sigOpCount: ops,
     // The previous output's value+script: required so the wasm can compute the sighash.
     utxo: {
+      // The kaspa-wasm UtxoEntryReference deserializer requires the outpoint INSIDE the utxo
+      // entry (matching IUtxoEntry.outpoint), not only on the input. Omitting it makes serde
+      // fail with a misleading "outpoint is not an object".
+      outpoint,
       address: undefined,
       amount: BigInt(p.utxo.amount),
       scriptPublicKey: p.utxo.scriptPublicKey || p2sh,
@@ -830,7 +1003,7 @@ export async function buildUnsignedSpend(p) {
     },
   };
 
-  const outputScript = addressToScriptPublicKey(p.destAddr);
+  const outputScript = payToAddressScript(p.destAddr);
   const output = { value, scriptPublicKey: outputScript };
 
   const tx = new Transaction({
@@ -846,27 +1019,71 @@ export async function buildUnsignedSpend(p) {
 }
 
 /**
+ * Derive the 32-byte x-only (schnorr) pubkey for a private key, LOCALLY via kaspa-wasm. The
+ * key never leaves this function. Used by signInput's fail-closed named-key pre-check and by
+ * any caller that wants to bind a key to a branch before signing.
+ *
+ * @param {string} privKeyHex - 32-byte secret key hex (browser-held; never transmitted)
+ * @returns {Promise<string>} the 64-hex-char x-only pubkey (a 02/03 prefix is stripped)
+ */
+export async function deriveXonlyPubkey(privKeyHex) {
+  const k = await loadWasm();
+  const { PrivateKey } = k;
+  const pk = new PrivateKey(privKeyHex);
+  try {
+    const xpub = pk.toXOnlyPublicKey
+      ? pk.toXOnlyPublicKey()
+      : (pk.toPublicKey && pk.toPublicKey().toXOnlyPublicKey ? pk.toPublicKey().toXOnlyPublicKey() : null);
+    if (!xpub) throw new Error('could not derive an x-only pubkey from this key');
+    const s = (xpub.toString ? xpub.toString() : String(xpub)).replace(/^0x/i, '');
+    return s.length === 66 ? s.slice(2) : s; // strip a 02/03 compressed prefix if present
+  } finally {
+    if (pk && typeof pk.free === 'function') pk.free();
+  }
+}
+
+/**
  * Produce the 64-byte BIP340 signature for input `idx` over the tx's sighash, using a
  * private key held entirely in the browser. Uses kaspa-wasm's createInputSignature with
  * the default SIG_HASH_ALL. The key never leaves this function.
  *
+ * FAIL-CLOSED named-key binding: when `opts.redeemHex` and `opts.kind` are supplied, the
+ * signer's x-only pubkey is derived locally and run through assertSignerForBranch BEFORE
+ * signing, so a wrong key / wrong branch fails fast (and never wastes a fee on a doomed tx)
+ * instead of failing late at the node. zk_game_settle has no SIGNER_INDEX_MAP entry, so the
+ * bind is skipped for it (the consensus-critical buildSatisfier still gates correctness).
+ *
  * @param {object} tx     - the unsigned Transaction (or SignableTransaction) from buildUnsignedSpend
  * @param {number} idx    - input index to sign
  * @param {string} privKeyHex - 32-byte secret key hex (browser-held; never transmitted)
+ * @param {{ redeemHex?: string, kind?: string, branch?: string }} [opts] - when redeemHex+kind
+ *        are set, bind the key to the (kind, branch) signer before signing.
  * @returns {Promise<Uint8Array>} the 64-byte schnorr signature (feed to buildSatisfier)
  */
-export async function signInput(tx, idx, privKeyHex) {
+export async function signInput(tx, idx, privKeyHex, opts = {}) {
   const k = await loadWasm();
   const { PrivateKey, createInputSignature, SighashType } = k;
+  // Fail-closed bind: prove this key is the chain-checked key for (kind, branch) before signing.
+  if (opts && opts.redeemHex && opts.kind && SIGNER_INDEX_MAP[opts.kind]) {
+    const xonly = await deriveXonlyPubkey(privKeyHex);
+    assertSignerForBranch(opts.redeemHex, opts.kind, opts.branch || 'claim', xonly);
+  }
   const pk = new PrivateKey(privKeyHex);
   try {
     // createInputSignature(tx, inputIndex, privateKey, sighashType) -> hex/bytes.
     const sighashAll = SighashType ? SighashType.All : undefined;
     const sigRaw = createInputSignature(tx, idx, pk, sighashAll);
     let sig = typeof sigRaw === 'string' ? hexToBytes(sigRaw) : new Uint8Array(sigRaw);
-    // kaspa-wasm may return 64 bytes (raw) or 65 (sig||sighashtype). Normalize to 64;
-    // push65() re-appends the sighash-type byte to match the Rust wire form.
-    if (sig.length === 65) sig = sig.slice(0, 64);
+    // Normalize to the raw 64-byte BIP340 signature. @onekeyfe/kaspa-wasm's
+    // createInputSignature returns the 66-byte push-ready framing
+    // [OpData65 (0x41)] [64-byte sig] [SIG_HASH_ALL (0x01)]; older/other builds return 65
+    // (sig || sighashtype) or a raw 64. push65() in the pure core re-adds the framing, so we
+    // must hand it the bare 64-byte signature here.
+    if (sig.length === 66 && sig[0] === OPCODES.OpData65 && sig[65] === SIG_HASH_ALL) {
+      sig = sig.slice(1, 65);
+    } else if (sig.length === 65) {
+      sig = sig.slice(0, 64);
+    }
     if (sig.length !== 64) throw new Error(`unexpected signature length ${sig.length}`);
     return sig;
   } finally {

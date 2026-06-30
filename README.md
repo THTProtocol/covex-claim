@@ -113,35 +113,43 @@ what, choose a covenant kind whose row above says "yes".
 
 ## What to save as your recovery kit
 
-When a covenant is created and funded, save a small JSON "recovery kit" so you can claim
-later even if Covex is gone. The tool accepts this shape (snake_case; a few aliases are
-also accepted):
+When a covenant is created and funded, save the JSON "recovery kit" so you can claim later
+even if Covex is gone. The Covex app exports the kit in this NESTED, versioned shape (the
+covenant fields live under `covenant`, and `redeem_kind` may carry a `:<suffix>` such as
+`binary_oracle_select:144` which the tool strips automatically):
 
 ```json
 {
-  "kind": "binary_oracle_select",
-  "network": "mainnet",
-  "redeem_script_hex": "....",
-  "p2sh_address": "kaspa:....",
-  "funding": { "transactionId": "....", "index": 0, "amount": "100000000" },
-  "branch": "revealA",
-  "preimage_hex": "....",
-  "lock_daa": null,
-  "total": null
+  "covex_recovery_kit_version": 2,
+  "covenant": {
+    "network": "mainnet",
+    "p2sh_address": "kaspa:....",
+    "redeem_kind": "binary_oracle_select:144",
+    "redeem_script_hex": "....",
+    "lock_daa": null,
+    "revealed_secret": null
+  }
 }
 ```
 
-Field by field:
+Older FLAT kits are still accepted (`{ "kind": "...", "network": "...", "redeem_script_hex":
+"...", "p2sh_address": "...", "funding": {...}, "branch": "...", "preimage_hex": "...",
+"lock_daa": null }`); a few field aliases are also accepted.
 
-- `kind` - the covenant base kind (see the matrix above).
+Field by field (under `covenant` for a v2 kit, or top-level for a flat kit):
+
+- `redeem_kind` / `kind` - the covenant kind, with or without a `:<suffix>` (the tool folds
+  it to its base kind; see the matrix above).
 - `network` - `mainnet`, `testnet-10`, or `testnet-12`. The destination address prefix is
   validated against this.
 - `redeem_script_hex` - the full redeem script. This is the source of truth the chain
   enforces; the P2SH address is derived from it.
 - `p2sh_address` - the covenant address, for your own cross-check (the tool re-derives the
   P2SH from the redeem script).
-- `funding` - the covenant UTXO you are spending: `transactionId`, `index`, and `amount`
-  in sompi. Find it on any block explorer for the P2SH address if you did not save it.
+- `funding` - OPTIONAL. The v2 kit does not include it. The covenant UTXO you are spending:
+  `transactionId`, `index`, and `amount` in sompi. If it is not in the kit, look it up on any
+  block explorer for the P2SH address and paste it into the tool as
+  `transactionId:index:amount`.
 - `branch` - which spend path you intend (see the per-kind notes). You can override it in
   the UI.
 - `preimage_hex` - the revealed secret, for `hashlock`, `htlc` claim, and
@@ -216,7 +224,7 @@ downloading or building, compute its SHA-256 and compare it to the value below.
 Published SHA-256 of `covex-claim.html`:
 
 ```
-a8f5d7c1e27d7b5cb88be08d19616e36cc1532820795c643f1c0ceb55b1377e4
+f0d32c0ca0dbd96790c7939648fc946edaba4754d9399fc55b5c3ea867026bd6
 ```
 
 Compute it yourself:

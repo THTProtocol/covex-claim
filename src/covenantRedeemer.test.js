@@ -339,10 +339,16 @@ describe('parseRedeemPubkeys', () => {
 // sigOpCount per kind (port of SpendKind::sig_op_count).
 // ---------------------------------------------------------------------------
 describe('sigOpCount', () => {
-  it('1 for singlesig/hashlock/timelock/rcsv/htlc', () => {
-    for (const k of ['singlesig', 'hashlock', 'timelock', 'rcsv', 'htlc']) {
+  it('1 for singlesig/hashlock/timelock/rcsv', () => {
+    for (const k of ['singlesig', 'hashlock', 'timelock', 'rcsv']) {
       expect(sigOpCount(k)).toBe(1);
     }
+  });
+
+  it('2 for htlc (claim + refund branch each have a CheckSig; declaring 1 locks the funds)', () => {
+    // Regression: SpendKind::Htlc.sig_op_count() == 2 (backend/src/covenant_builder.rs:649).
+    // htlc==1 made every HTLC spend fail WrongSigOpCount(1, 2) and permanently lock the UTXO.
+    expect(sigOpCount('htlc')).toBe(2);
   });
 
   it('2 for deadman', () => {
